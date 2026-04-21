@@ -744,6 +744,635 @@ def print_split_stats(data_root: str, split: str) -> None:
 # Test rapide (exécuté uniquement si ce fichier est lancé directement)
 # =============================================================================
 
+# =============================================================================
+# Dataset PyTorch pour le tracking — charge les données de data_tracking/
+# =============================================================================
+
+import torchvision.transforms.functional as TF  # API fonctionnelle pour les transforms
+
+
+class JHUCrowdTrackingDataset(Dataset):
+    """
+    Dataset PyTorch pour le tracking de foule entre paires de frames.
+
+    Ce dataset charge les données générées par ``dataCleaning.build_tracking_dataset``
+    (dossier ``data_tracking/``).
+
+    Pour chaque exemple, deux frames (A et B) sont retournées avec :
+      - les boîtes englobantes des têtes dans chaque frame,
+      - les liens de correspondance (quelle tête de A correspond à quelle tête de B).
+
+    Ces informations permettent d'entraîner un modèle à :
+        1. Détecter les têtes dans chaque frame
+        2. Apparier les têtes entre frames (stayed / left / entered)
+        3. Compter en temps réel les entrées, sorties et personnes présentes
+
+    Contenu retourné par ``__getitem__`` :
+        {
+          "frame_A"       : Tensor (3, H, W)   — Frame A normalisée
+          "frame_B"       : Tensor (3, H, W)   — Frame B normalisée
+          "boxes_A"       : Tensor (N_A, 4)    — boîtes xyxy dans Frame A
+          "boxes_B"       : Tensor (N_B, 4)    — boîtes xyxy dans Frame B
+          "links"         : Tensor (L, 2)      — paires [idx_A, idx_B] des têtes appariées
+          "count_A"       : int                — personnes dans Frame A
+          "count_B"       : int                — personnes dans Frame B
+          "count_stayed"  : int                — personnes présentes dans les deux frames
+          "count_left"    : int                — personnes qui ont quitté le champ
+          "count_entered" : int                — personnes qui sont entrées dans le champ
+          "image_id"      : str                — identifiant de l'image source
+          "scene"         : str                — type de lieu
+          "weather"       : int                — code météo
+        }
+    """
+
+    WEATHER = {0: "no-degradation", 1: "fog/haze", 2: "rain", 3: "snow"}
+
+    # -------------------------------------------------------------------------
+    # Initialisation
+    # -------------------------------------------------------------------------
+
+    def __init__(
+        self,
+        root_dir: str,
+        split: str = "train",
+        img_size: tuple | None = None,
+        augment: bool = False,
+    ):
+        """
+        Initialise le dataset de tracking et charge les métadonnées en mémoire.
+
+        Les images, annotations et liens sont chargés à la demande dans
+        ``__getitem__`` pour ne pas surcharger la RAM.
+
+        Args:
+            root_dir (str):
+                Chemin vers le dossier ``data_tracking/`` généré par dataCleaning.py.
+
+            split (str):
+                Sous-ensemble à utiliser : "train", "val" ou "test".
+
+            img_size (tuple | None):
+                (H, W) de redimensionnement, ou None pour garder la taille des crops.
+                Fortement recommandé : les crops ont des tailles légèrement variables
+                selon le décalage appliqué → fournir un ``img_size`` fixe garantit
+                des batchs homogènes.
+
+            augment (bool):
+                Si True (train uniquement), applique :
+                  - flip horizontal aléatoire (cohérent sur les deux frames)
+                  - perturbation de couleur cohérente (même paramètres pour A et B)
+        """
+        assert split in ("train", "val", "test"), f"Split inconnu : {split}"
+
+        self.root_dir = root_dir
+        self.split    = split
+        self.img_size = img_size
+        # L'augmentation n'est active qu'en entraînement
+        self.augment  = augment and split == "train"
+
+        # Chemins des sous-dossiers du split
+        self.frames_A_dir = os.path.join(root_dir, split, "frames_A")
+        self.frames_B_dir = os.path.join(root_dir, split, "frames_B")
+        self.gt_A_dir     = os.path.join(root_dir, split, "gt_A")
+        self.gt_B_dir     = os.path.join(root_dir, split, "gt_B")
+        self.links_dir    = os.path.join(root_dir, split, "gt_links")
+        self.labels_file  = os.path.join(root_dir, split, "image_labels.txt")
+
+        # Lecture des métadonnées (image_labels.txt tracking)
+        self.image_labels = self._load_image_labels()
+        self.image_ids    = list(self.image_labels.keys())
+
+        # Normalisation ImageNet standard
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+
+    # -------------------------------------------------------------------------
+    # Méthodes privées de parsing
+    # -------------------------------------------------------------------------
+
+    def _load_image_labels(self) -> dict:
+        """
+        Lit le fichier ``image_labels.txt`` du dataset de tracking.
+
+        Format de chaque ligne :
+            id,count_A,count_B,count_stayed,count_left,count_entered,scene,weather,distractor
+        Exemple :
+            0001,161,158,155,6,3,water park,0,0
+
+        Returns:
+            dict[str, dict] : clés = identifiants d'images (ex : "0001"),
+            valeurs = dicts avec les champs :
+                - "count_A"       (int) : têtes dans Frame A
+                - "count_B"       (int) : têtes dans Frame B
+                - "count_stayed"  (int) : têtes appariées (présentes dans les deux)
+                - "count_left"    (int) : têtes ayant quitté le champ
+                - "count_entered" (int) : têtes ayant rejoint le champ
+                - "scene"         (str) : type de lieu
+                - "weather"       (int) : code météo
+                - "distractor"    (int) : 1 si image distracteur
+        """
+        labels = {}
+        with open(self.labels_file, "r") as f:
+            for line in f:
+                parts = [p.strip() for p in line.strip().split(",")]
+                # Le format tracking a 9 colonnes
+                if len(parts) < 9:
+                    continue
+                labels[parts[0]] = {
+                    "count_A":       int(parts[1]),
+                    "count_B":       int(parts[2]),
+                    "count_stayed":  int(parts[3]),
+                    "count_left":    int(parts[4]),
+                    "count_entered": int(parts[5]),
+                    "scene":         parts[6],
+                    "weather":       int(parts[7]),
+                    "distractor":    int(parts[8]),
+                }
+        return labels
+
+    def _load_gt_file(self, gt_path: str) -> list[dict]:
+        """
+        Lit un fichier d'annotations (gt_A/*.txt ou gt_B/*.txt).
+
+        Format identique au dataset original :
+            x  y  w  h  occlusion  blur
+
+        Args:
+            gt_path (str) : chemin vers le fichier .txt.
+
+        Returns:
+            list[dict] : liste des têtes annotées (peut être vide).
+        """
+        anns = []
+        if not os.path.exists(gt_path):
+            return anns
+        with open(gt_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 6:
+                    anns.append({
+                        "x": int(parts[0]),
+                        "y": int(parts[1]),
+                        "w": int(parts[2]),
+                        "h": int(parts[3]),
+                        "occlusion": int(parts[4]),
+                        "blur":      int(parts[5]),
+                    })
+        return anns
+
+    def _load_links_file(self, links_path: str) -> list[tuple[int, int]]:
+        """
+        Lit le fichier de liens de correspondance (gt_links/*.txt).
+
+        Format : une ligne par lien → idx_A  idx_B
+        où idx_A est le numéro de ligne dans gt_A et idx_B dans gt_B.
+
+        Args:
+            links_path (str) : chemin vers le fichier .txt des liens.
+
+        Returns:
+            list[tuple[int,int]] : liste de paires (idx_A, idx_B).
+        """
+        links = []
+        if not os.path.exists(links_path):
+            return links
+        with open(links_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    links.append((int(parts[0]), int(parts[1])))
+        return links
+
+    # -------------------------------------------------------------------------
+    # Conversion annotations → boîtes englobantes
+    # -------------------------------------------------------------------------
+
+    def _anns_to_boxes(
+        self,
+        anns: list[dict],
+        scale_x: float = 1.0,
+        scale_y: float = 1.0,
+    ) -> torch.Tensor:
+        """
+        Convertit les annotations (centre + taille) en boîtes xyxy mises à l'échelle.
+
+        Les annotations stockent la position du CENTRE de chaque tête (x, y) et
+        sa taille approximative (w, h).  Le format "xyxy" (coin supérieur-gauche,
+        coin inférieur-droit) est le standard utilisé par la plupart des détecteurs.
+
+        Formule :
+            x1 = (x - w/2) * scale_x
+            y1 = (y - h/2) * scale_y
+            x2 = (x + w/2) * scale_x
+            y2 = (y + h/2) * scale_y
+
+        Args:
+            anns (list[dict]) : annotations avec clés x, y, w, h.
+            scale_x (float)   : facteur d'échelle horizontal (si image redimensionnée).
+            scale_y (float)   : facteur d'échelle vertical.
+
+        Returns:
+            Tensor de forme (N, 4) dtype float32, ou (0, 4) si liste vide.
+        """
+        if not anns:
+            return torch.zeros((0, 4), dtype=torch.float32)
+
+        return torch.tensor(
+            [
+                [
+                    (a["x"] - a["w"] / 2) * scale_x,   # x1 = bord gauche
+                    (a["y"] - a["h"] / 2) * scale_y,   # y1 = bord haut
+                    (a["x"] + a["w"] / 2) * scale_x,   # x2 = bord droit
+                    (a["y"] + a["h"] / 2) * scale_y,   # y2 = bord bas
+                ]
+                for a in anns
+            ],
+            dtype=torch.float32,
+        )
+
+    # -------------------------------------------------------------------------
+    # Augmentation cohérente sur les deux frames
+    # -------------------------------------------------------------------------
+
+    def _apply_augmentation(
+        self,
+        img_A: Image.Image,
+        img_B: Image.Image,
+        anns_A: list[dict],
+        anns_B: list[dict],
+    ) -> tuple:
+        """
+        Applique des transformations aléatoires COHÉRENTES aux deux frames.
+
+        Cohérence = même décision aléatoire pour Frame A et Frame B, afin que
+        les correspondances spatiales entre les deux frames restent valides après
+        augmentation.
+
+        Transformations appliquées :
+          1. Flip horizontal (50 % de probabilité) :
+               - La décision flip / ne-flip est la même pour les deux frames.
+               - Les coordonnées x sont mises à jour : x_new = w - 1 - x_old
+               - Les indices des liens (links) ne changent pas (ce sont juste
+                 des numéros de lignes dans gt_A et gt_B, pas des coordonnées).
+
+          2. Perturbation de couleur (brightness / contrast / saturation) :
+               - Les MÊMES paramètres aléatoires sont appliqués aux deux frames.
+               - Simule des conditions d'éclairage légèrement variables mais
+                 cohérentes entre deux instants proches.
+
+        Args:
+            img_A, img_B   : images PIL des deux frames.
+            anns_A, anns_B : listes d'annotations des deux frames.
+
+        Returns:
+            tuple (img_A, img_B, anns_A, anns_B) potentiellement transformés.
+        """
+        # --- 1. Flip horizontal ---
+        if np.random.rand() < 0.5:
+            # Largeur des deux frames (elles ont la même taille)
+            w = img_A.width
+
+            # Retournement des deux images
+            img_A = img_A.transpose(Image.FLIP_LEFT_RIGHT)
+            img_B = img_B.transpose(Image.FLIP_LEFT_RIGHT)
+
+            # Mise à jour des coordonnées x : formule x_new = w - 1 - x_old
+            # {**a, "x": ...} crée une copie du dict a avec x mis à jour
+            anns_A = [{**a, "x": w - 1 - a["x"]} for a in anns_A]
+            anns_B = [{**a, "x": w - 1 - a["x"]} for a in anns_B]
+            # Note : les liens (idx_A, idx_B) ne dépendent pas des coordonnées,
+            # ils restent valides après le flip.
+
+        # --- 2. Perturbation de couleur cohérente ---
+        # On calcule UN seul jeu de paramètres aléatoires, appliqué aux deux frames.
+        # TF.adjust_* prend une PIL Image et retourne une PIL Image transformée.
+        brightness = float(np.random.uniform(0.8, 1.2))   # facteur ∈ [0.8, 1.2]
+        contrast   = float(np.random.uniform(0.8, 1.2))
+        saturation = float(np.random.uniform(0.8, 1.2))
+
+        # Application dans un ordre fixe (brightness → contrast → saturation)
+        img_A = TF.adjust_brightness(img_A, brightness)
+        img_A = TF.adjust_contrast(img_A, contrast)
+        img_A = TF.adjust_saturation(img_A, saturation)
+
+        img_B = TF.adjust_brightness(img_B, brightness)
+        img_B = TF.adjust_contrast(img_B, contrast)
+        img_B = TF.adjust_saturation(img_B, saturation)
+
+        return img_A, img_B, anns_A, anns_B
+
+    # -------------------------------------------------------------------------
+    # Interface PyTorch Dataset (méthodes obligatoires)
+    # -------------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        """
+        Retourne le nombre de paires de frames dans ce split.
+
+        Returns:
+            int : nombre d'exemples (= nombre d'images originales du split).
+        """
+        return len(self.image_ids)
+
+    def __getitem__(self, idx: int) -> dict:
+        """
+        Charge et retourne une paire complète (Frame A + Frame B) avec ses labels.
+
+        Pipeline complet :
+            1. Chargement des deux images JPEG
+            2. Chargement des annotations gt_A, gt_B et des liens gt_links
+            3. Augmentation (flip + couleur) si mode entraînement
+            4. Redimensionnement si img_size est fourni
+            5. Conversion PIL → Tensor normalisé
+            6. Conversion annotations → boîtes xyxy (avec mise à l'échelle)
+            7. Conversion liens → Tensor
+
+        Args:
+            idx (int) : indice de l'exemple (entre 0 et len(dataset)-1).
+
+        Returns:
+            dict avec les clés :
+                "frame_A"       : Tensor (3, H, W) — Frame A normalisée
+                "frame_B"       : Tensor (3, H, W) — Frame B normalisée
+                "boxes_A"       : Tensor (N_A, 4)  — boîtes xyxy Frame A
+                "boxes_B"       : Tensor (N_B, 4)  — boîtes xyxy Frame B
+                "links"         : Tensor (L, 2)    — paires [idx_A, idx_B]
+                "count_A"       : int
+                "count_B"       : int
+                "count_stayed"  : int
+                "count_left"    : int
+                "count_entered" : int
+                "image_id"      : str
+                "scene"         : str
+                "weather"       : int
+        """
+        img_id     = self.image_ids[idx]
+        label_info = self.image_labels[img_id]
+
+        # --- Chargement des deux images ---
+        img_A = Image.open(
+            os.path.join(self.frames_A_dir, f"{img_id}.jpg")
+        ).convert("RGB")
+        img_B = Image.open(
+            os.path.join(self.frames_B_dir, f"{img_id}.jpg")
+        ).convert("RGB")
+
+        # Les deux frames ont la même taille (même crop shift)
+        orig_w, orig_h = img_A.size  # PIL renvoie (largeur, hauteur)
+
+        # --- Chargement des annotations et des liens ---
+        anns_A = self._load_gt_file(os.path.join(self.gt_A_dir,  f"{img_id}.txt"))
+        anns_B = self._load_gt_file(os.path.join(self.gt_B_dir,  f"{img_id}.txt"))
+        links  = self._load_links_file(os.path.join(self.links_dir, f"{img_id}.txt"))
+
+        # --- Augmentation (entraînement uniquement) ---
+        if self.augment:
+            img_A, img_B, anns_A, anns_B = self._apply_augmentation(
+                img_A, img_B, anns_A, anns_B
+            )
+
+        # --- Redimensionnement ---
+        if self.img_size is not None:
+            out_h, out_w = self.img_size
+            # PIL.Image.resize prend (largeur, hauteur) — ordre inverse de img_size
+            img_A = img_A.resize((out_w, out_h), Image.BILINEAR)
+            img_B = img_B.resize((out_w, out_h), Image.BILINEAR)
+        else:
+            out_h, out_w = orig_h, orig_w
+
+        # --- Facteurs d'échelle pour les coordonnées des boîtes ---
+        # Si on a redimensionné l'image, on doit aussi mettre à l'échelle
+        # les coordonnées des annotations (elles étaient en pixels originaux)
+        scale_x = out_w / orig_w
+        scale_y = out_h / orig_h
+
+        # --- Conversion PIL Image → Tensor PyTorch normalisé ---
+        # ToTensor :  PIL (H,W,3) uint8 [0-255] → Tensor (3,H,W) float32 [0-1]
+        # normalize : soustrait moyenne ImageNet, divise par écart-type
+        tensor_A = self.normalize(transforms.ToTensor()(img_A))
+        tensor_B = self.normalize(transforms.ToTensor()(img_B))
+
+        # --- Conversion annotations → boîtes englobantes xyxy ---
+        boxes_A = self._anns_to_boxes(anns_A, scale_x, scale_y)
+        boxes_B = self._anns_to_boxes(anns_B, scale_x, scale_y)
+
+        # --- Conversion liens → Tensor (L, 2) ---
+        # Chaque ligne = [idx_tête_dans_boxes_A, idx_tête_dans_boxes_B]
+        if links:
+            links_tensor = torch.tensor(links, dtype=torch.long)  # (L, 2)
+        else:
+            # Aucune correspondance (image sans personnes ou toutes parties)
+            links_tensor = torch.zeros((0, 2), dtype=torch.long)
+
+        return {
+            "frame_A":       tensor_A,                   # Tensor (3, H, W)
+            "frame_B":       tensor_B,                   # Tensor (3, H, W)
+            "boxes_A":       boxes_A,                    # Tensor (N_A, 4) xyxy
+            "boxes_B":       boxes_B,                    # Tensor (N_B, 4) xyxy
+            "links":         links_tensor,               # Tensor (L, 2)   [idx_A, idx_B]
+            "count_A":       label_info["count_A"],      # int
+            "count_B":       label_info["count_B"],      # int
+            "count_stayed":  label_info["count_stayed"], # int
+            "count_left":    label_info["count_left"],   # int
+            "count_entered": label_info["count_entered"],# int
+            "image_id":      img_id,                     # str
+            "scene":         label_info["scene"],        # str
+            "weather":       label_info["weather"],      # int
+        }
+
+
+# =============================================================================
+# Collate personnalisée pour les paires de frames (tailles variables)
+# =============================================================================
+
+def _collate_tracking_pairs(batch: list[dict]) -> dict:
+    """
+    Regroupe une liste de paires en un seul batch pour le DataLoader.
+
+    Problème : les boîtes (boxes_A, boxes_B) et les liens (links) ont un
+    nombre variable de lignes selon l'image (le nombre de têtes diffère).
+    PyTorch ne peut pas empiler automatiquement des tenseurs de tailles
+    différentes → on garde ces champs sous forme de listes Python.
+
+    Les images, en revanche, ont toutes la même taille si ``img_size`` est
+    défini → on peut les empiler en un seul tenseur (B, 3, H, W).
+
+    Args:
+        batch (list[dict]) : liste de dictionnaires retournés par __getitem__.
+
+    Returns:
+        dict : même structure que __getitem__, mais :
+            - "frame_A", "frame_B" → Tensor (B, 3, H, W)
+            - "count_*"            → Tensor (B,)
+            - "boxes_A", "boxes_B", "links" → listes de longueur B
+            - "scene", "weather", "image_id" → listes de longueur B
+    """
+    return {
+        # Les images ont la même taille → on peut les empiler avec torch.stack
+        "frame_A": torch.stack([b["frame_A"] for b in batch]),   # (B, 3, H, W)
+        "frame_B": torch.stack([b["frame_B"] for b in batch]),   # (B, 3, H, W)
+
+        # Les boîtes et liens ont des tailles variables → on garde des listes
+        # Chaque élément de la liste est un Tensor (Ni, 4) ou (Li, 2)
+        "boxes_A":  [b["boxes_A"]  for b in batch],  # liste de Tensor (N_Ai, 4)
+        "boxes_B":  [b["boxes_B"]  for b in batch],  # liste de Tensor (N_Bi, 4)
+        "links":    [b["links"]    for b in batch],  # liste de Tensor (Li, 2)
+
+        # Les comptages sont des scalaires → on les empile en tenseurs 1-D
+        "count_A":       torch.tensor([b["count_A"]       for b in batch]),
+        "count_B":       torch.tensor([b["count_B"]       for b in batch]),
+        "count_stayed":  torch.tensor([b["count_stayed"]  for b in batch]),
+        "count_left":    torch.tensor([b["count_left"]    for b in batch]),
+        "count_entered": torch.tensor([b["count_entered"] for b in batch]),
+
+        # Les chaînes et entiers restent en listes Python
+        "image_id": [b["image_id"] for b in batch],
+        "scene":    [b["scene"]    for b in batch],
+        "weather":  [b["weather"]  for b in batch],
+    }
+
+
+# =============================================================================
+# Fonction utilitaire : DataLoader de tracking prêt à l'emploi
+# =============================================================================
+
+def get_tracking_dataloader(
+    data_root: str,
+    split: str = "train",
+    batch_size: int = 4,
+    img_size: tuple | None = None,
+    augment: bool = True,
+    num_workers: int = 0,
+    shuffle: bool | None = None,
+) -> tuple[DataLoader, JHUCrowdTrackingDataset]:
+    """
+    Crée et retourne un DataLoader PyTorch pour le dataset de tracking.
+
+    Ce DataLoader charge les paires (Frame A, Frame B) avec leurs annotations
+    et liens, prêtes à être utilisées dans une boucle d'entraînement.
+
+    Exemple d'utilisation dans une boucle d'entraînement :
+        loader, dataset = get_tracking_dataloader("data_tracking/", split="train",
+                                                   batch_size=4, img_size=(512,512))
+        for batch in loader:
+            frame_A  = batch["frame_A"]   # Tensor (4, 3, 512, 512)
+            frame_B  = batch["frame_B"]   # Tensor (4, 3, 512, 512)
+            boxes_A  = batch["boxes_A"]   # liste de 4 tenseurs (Ni, 4)
+            links    = batch["links"]     # liste de 4 tenseurs (Li, 2)
+            # ... passer dans le modèle
+
+    Args:
+        data_root (str):
+            Chemin vers le dossier ``data_tracking/`` généré par dataCleaning.py.
+
+        split (str):
+            "train", "val" ou "test".
+
+        batch_size (int):
+            Nombre de paires par batch.  Valeurs courantes : 2, 4, 8.
+            Les paires contiennent deux images → la mémoire GPU requise est
+            environ le double d'un dataset de comptage pour le même batch_size.
+
+        img_size (tuple | None):
+            (H, W) de redimensionnement.  Fortement recommandé car les crops
+            ont des tailles légèrement variables selon le shift calculé.
+
+        augment (bool):
+            Active flip + perturbation de couleur cohérente (train seulement).
+
+        num_workers (int):
+            Processus parallèles de chargement.  0 = sûr sur Windows.
+
+        shuffle (bool | None):
+            True = ordre aléatoire (défaut pour train), False = ordre fixe.
+
+    Returns:
+        tuple[DataLoader, JHUCrowdTrackingDataset] :
+            - DataLoader : à utiliser dans ``for batch in loader:``
+            - JHUCrowdTrackingDataset : le dataset sous-jacent
+    """
+    if shuffle is None:
+        shuffle = split == "train"
+
+    dataset = JHUCrowdTrackingDataset(
+        root_dir = data_root,
+        split    = split,
+        img_size = img_size,
+        augment  = augment,
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size  = batch_size,
+        shuffle     = shuffle,
+        num_workers = num_workers,
+        # pin_memory=True accélère le transfert CPU→GPU (si GPU disponible)
+        pin_memory  = torch.cuda.is_available(),
+        # Les boîtes et liens ont des tailles variables → collate personnalisée
+        collate_fn  = _collate_tracking_pairs,
+    )
+
+    return loader, dataset
+
+
+# =============================================================================
+# Statistiques rapides du dataset de tracking
+# =============================================================================
+
+def print_tracking_stats(data_root: str, split: str) -> None:
+    """
+    Affiche des statistiques descriptives sur un split du dataset de tracking.
+
+    Lit uniquement le fichier image_labels.txt (pas les images) pour calculer :
+        - nombre de paires
+        - distribution des stayed / left / entered
+        - pourcentage de flux entrant/sortant
+
+    Args:
+        data_root (str) : chemin vers le dossier ``data_tracking/``.
+        split (str)     : "train", "val" ou "test".
+
+    Returns:
+        None (affiche dans la console).
+    """
+    labels_file = os.path.join(data_root, split, "image_labels.txt")
+
+    # Accumulateurs pour les statistiques globales
+    counts_A, stayed_list, left_list, entered_list = [], [], [], []
+
+    with open(labels_file, "r") as f:
+        for line in f:
+            parts = [p.strip() for p in line.strip().split(",")]
+            if len(parts) < 9:
+                continue
+            counts_A.append(int(parts[1]))
+            stayed_list.append(int(parts[3]))
+            left_list.append(int(parts[4]))
+            entered_list.append(int(parts[5]))
+
+    if not counts_A:
+        print(f"  Aucune donnée dans {labels_file}")
+        return
+
+    total_A       = sum(counts_A)
+    total_stayed  = sum(stayed_list)
+    total_left    = sum(left_list)
+    total_entered = sum(entered_list)
+
+    print(f"\n=== TRACKING {split.upper()} ({len(counts_A)} paires) ===")
+    print(f"  Têtes Frame A  — min {min(counts_A):,}  max {max(counts_A):,}  "
+          f"mean {np.mean(counts_A):.1f}")
+    print(f"  Stayed   : {total_stayed:>8,}  ({100*total_stayed/total_A:.1f} % de Frame A)")
+    print(f"  Left     : {total_left:>8,}  ({100*total_left/total_A:.1f} % de Frame A)")
+    print(f"  Entered  : {total_entered:>8,}")
+
+
+# =============================================================================
+# Smoke test (existant — inchangé)
+# =============================================================================
+
 if __name__ == "__main__":
     # Calcul du chemin vers data/ relatif à ce fichier (projects/dataGathering.py)
     # os.path.dirname(__file__) → dossier projects/
