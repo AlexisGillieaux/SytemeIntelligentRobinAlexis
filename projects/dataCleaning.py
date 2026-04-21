@@ -74,6 +74,17 @@ Paramètres clés
       Valeur par défaut : 30 px.  Représente une caméra qui "pan" légèrement.
       Automatiquement plafonné à 5 % de la plus petite dimension de l'image.
 
+  brightness_jitter (float) : amplitude maximale de variation de luminosité globale (±).
+      Par défaut 0.08 → la frame peut être jusqu'à 8 % plus claire ou plus sombre.
+
+  color_jitter (float) : amplitude maximale du décalage colorimétrique par canal (±).
+      Par défaut 0.05 → chaque canal BGR peut varier indépendamment de ±5 %,
+      simulant une légère dominante colorée (blanc chaud, froid, verdâtre…).
+
+  noise_sigma (float) : écart-type du bruit Gaussien additif (sur l'échelle 0-255).
+      Par défaut 3.0 → bruit très fin, à peine perceptible à l'œil mais présent
+      dans toute image issue d'un capteur CCD/CMOS.
+
   seed (int) : graine du générateur aléatoire pour la reproductibilité.
       Même graine → même dataset généré.
 
@@ -382,6 +393,108 @@ def _save_links_file(path: str, links: list[tuple[int, int]]) -> None:
 
 
 # =============================================================================
+# Simulation des artefacts vidéo
+# =============================================================================
+
+def _apply_video_artifacts(
+    image_bgr: np.ndarray,
+    rng: np.random.Generator,
+    brightness_jitter: float = 0.08,
+    color_jitter: float = 0.05,
+    noise_sigma: float = 3.0,
+) -> np.ndarray:
+    """
+    Applique de légers artefacts visuels à une image pour simuler une frame vidéo.
+
+    Dans une vraie vidéo, chaque frame subit plusieurs dégradations physiques :
+      - Le capteur de la caméra ajoute un bruit électronique aléatoire.
+      - L'exposition automatique fait varier légèrement la luminosité.
+      - La balance des blancs peut dériver, créant une légère dominante colorée.
+      - La compression vidéo (H.264, HEVC…) introduit des artefacts de bloc.
+
+    Cette fonction reproduit ces effets de façon contrôlée et subtile, avec
+    des paramètres indépendants pour chaque frame (Frame A ≠ Frame B), ce qui
+    est essentiel pour que le modèle apprenne à être robuste à ces variations.
+
+    Pipeline d'effets appliqués (dans l'ordre) :
+        1. Variation de luminosité globale   → simule l'exposition automatique
+        2. Décalage colorimétrique par canal → simule la balance des blancs
+        3. Bruit Gaussien additif            → simule le bruit du capteur
+
+    Les trois effets sont subtils individuellement mais combinés, ils donnent
+    aux deux frames un aspect suffisamment différent pour tromper un modèle
+    naïf, l'obligeant à apprendre des caractéristiques robustes.
+
+    Args:
+        image_bgr (np.ndarray):
+            Image au format BGR (OpenCV), dtype uint8, valeurs dans [0, 255].
+            Shape attendue : (H, W, 3).
+
+        rng (np.random.Generator):
+            Générateur aléatoire NumPy partagé.  Chaque appel consomme quelques
+            tirages aléatoires, ce qui garantit la reproductibilité si la même
+            graine est utilisée.
+
+        brightness_jitter (float):
+            Amplitude maximale de la variation de luminosité globale.
+            Un facteur b ∈ [1 - jitter, 1 + jitter] est tiré uniformément.
+            Exemple : 0.08 → b ∈ [0.92, 1.08] → l'image peut être ±8 % plus lumineuse.
+            Valeur par défaut : 0.08
+
+        color_jitter (float):
+            Amplitude maximale du décalage colorimétrique par canal BGR.
+            Chaque canal reçoit un facteur indépendant c ∈ [1 - jitter, 1 + jitter].
+            Les trois facteurs différents créent une légère dominante colorée.
+            Exemple : 0.05 → canal bleu × 0.97, vert × 1.03, rouge × 1.01.
+            Valeur par défaut : 0.05
+
+        noise_sigma (float):
+            Écart-type du bruit Gaussien additif, sur l'échelle de valeurs [0, 255].
+            Un bruit N(0, sigma) est ajouté à chaque pixel de chaque canal.
+            Exemple : 3.0 → bruit ≈ ±6 niveaux de gris, imperceptible à l'œil.
+            Valeur par défaut : 3.0
+
+    Returns:
+        np.ndarray : image modifiée, même shape que l'entrée, dtype uint8.
+    """
+    # Conversion en float32 pour les opérations arithmétiques sans perte de précision
+    # (les opérations sur uint8 provoqueraient des débordements silencieux)
+    img = image_bgr.astype(np.float32)
+
+    # --- Effet 1 : variation de luminosité globale ---
+    # On multiplie TOUS les pixels de TOUS les canaux par un même facteur b.
+    # b > 1 → image plus claire,  b < 1 → image plus sombre.
+    # rng.uniform(a, b) tire un flottant aléatoire uniformément dans [a, b].
+    b = float(rng.uniform(1.0 - brightness_jitter, 1.0 + brightness_jitter))
+    img *= b
+
+    # --- Effet 2 : décalage colorimétrique par canal ---
+    # On multiplie chaque canal (B=0, G=1, R=2) par un facteur DIFFÉRENT.
+    # Cela simule une balance des blancs imparfaite ou une dominante colorée.
+    # Exemple : si le canal B reçoit ×0.97 et R reçoit ×1.04, l'image
+    # paraît légèrement plus chaude (plus rouge, moins bleue).
+    for canal in range(3):   # 0=Bleu, 1=Vert, 2=Rouge (ordre BGR d'OpenCV)
+        c = float(rng.uniform(1.0 - color_jitter, 1.0 + color_jitter))
+        img[:, :, canal] *= c
+
+    # --- Effet 3 : bruit Gaussien additif ---
+    # rng.normal(moyenne, sigma, shape) génère un tableau de bruit aléatoire.
+    # On l'ajoute pixel par pixel à l'image.
+    # Le bruit est indépendant pour chaque pixel ET pour chaque canal,
+    # ce qui simule le bruit électronique d'un capteur photo.
+    bruit = rng.normal(0.0, noise_sigma, img.shape).astype(np.float32)
+    img += bruit
+
+    # --- Clipping et reconversion en uint8 ---
+    # np.clip(x, 0, 255) ramène les valeurs hors de [0, 255] dans cet intervalle.
+    # Sans ce clamp, les pixels trop clairs deviendraient > 255 (débordement),
+    # et les pixels trop sombres deviendraient < 0.
+    img = np.clip(img, 0.0, 255.0).astype(np.uint8)
+
+    return img
+
+
+# =============================================================================
 # Traitement d'une image complète
 # =============================================================================
 
@@ -392,6 +505,9 @@ def _process_image(
     label_info: dict,
     split_out_dir: str,
     shift_range: int,
+    brightness_jitter: float,
+    color_jitter: float,
+    noise_sigma: float,
     rng: np.random.Generator,
 ) -> dict | None:
     """
@@ -401,8 +517,14 @@ def _process_image(
         1. Chargement de l'image avec OpenCV
         2. Calcul d'un décalage aléatoire (dx, dy)
         3. Découpage en Frame A et Frame B (deux crops complémentaires)
-        4. Génération des annotations pour chaque frame et des liens
-        5. Sauvegarde des deux images JPEG, des deux fichiers GT et du fichier links
+        4. Application d'artefacts vidéo indépendants sur chaque frame
+        5. Génération des annotations pour chaque frame et des liens
+        6. Sauvegarde des deux images JPEG, des deux fichiers GT et du fichier links
+
+    Les artefacts sont appliqués APRÈS le découpage et avec des tirages
+    aléatoires INDÉPENDANTS pour Frame A et Frame B, de sorte que les deux
+    frames d'une même paire ont des conditions visuelles légèrement différentes
+    — exactement comme deux instants successifs d'une vraie vidéo.
 
     Args:
         img_id (str)       : identifiant de l'image (ex : "0001").
@@ -410,7 +532,10 @@ def _process_image(
         gt_path (str)      : chemin vers le fichier d'annotations .txt original.
         label_info (dict)  : métadonnées de l'image (count, scene, weather, distractor).
         split_out_dir (str): dossier racine du split de sortie (ex : data_tracking/train/).
-        shift_range (int)  : décalage maximum en pixels.
+        shift_range (int)  : décalage maximum en pixels entre les deux crops.
+        brightness_jitter (float) : amplitude max de variation de luminosité (±).
+        color_jitter (float)      : amplitude max du décalage par canal BGR (±).
+        noise_sigma (float)       : écart-type du bruit Gaussien additif.
         rng (np.random.Generator) : générateur aléatoire partagé.
 
     Returns:
@@ -434,12 +559,34 @@ def _process_image(
 
     # --- Création des deux crops ---
     # Frame A = coin supérieur-gauche → lignes 0 à orig_h-dy, colonnes 0 à orig_w-dx
-    # L'indexation numpy [y1:y2, x1:x2] sélectionne les pixels dans cet rectangle
-    frame_A = image[0: orig_h - dy,  0: orig_w - dx]
+    # L'indexation numpy [y1:y2, x1:x2] sélectionne les pixels dans cet rectangle.
+    # .copy() est nécessaire pour que le tableau résultant soit une vraie copie
+    # indépendante (et non une simple "vue" de l'image originale) — sinon les
+    # modifications des artefacts se répercuteraient sur les deux frames.
+    frame_A = image[0: orig_h - dy,  0: orig_w - dx].copy()
 
     # Frame B = coin inférieur-droit → lignes dy à orig_h, colonnes dx à orig_w
     # Les deux crops ont exactement la même taille : (orig_h-dy) × (orig_w-dx)
-    frame_B = image[dy: orig_h,      dx: orig_w]
+    frame_B = image[dy: orig_h,      dx: orig_w].copy()
+
+    # --- Application des artefacts vidéo ---
+    # Chaque frame reçoit des paramètres aléatoires INDÉPENDANTS.
+    # Le rng est partagé entre les deux appels : le premier appel consomme
+    # quelques tirages, le second en consomme d'autres → valeurs différentes.
+    # Résultat : Frame A et Frame B ont des conditions visuelles distinctes,
+    # comme deux vraies frames consécutives d'une vidéo.
+    frame_A = _apply_video_artifacts(
+        frame_A, rng,
+        brightness_jitter=brightness_jitter,
+        color_jitter=color_jitter,
+        noise_sigma=noise_sigma,
+    )
+    frame_B = _apply_video_artifacts(
+        frame_B, rng,
+        brightness_jitter=brightness_jitter,
+        color_jitter=color_jitter,
+        noise_sigma=noise_sigma,
+    )
 
     # --- Génération des annotations ---
     anns = _parse_gt_file(gt_path)
@@ -497,6 +644,9 @@ def build_tracking_dataset(
     output_root: str,
     splits: tuple[str, ...] = ("train", "val", "test"),
     shift_range: int = 30,
+    brightness_jitter: float = 0.08,
+    color_jitter: float = 0.05,
+    noise_sigma: float = 3.0,
     seed: int = 42,
 ) -> None:
     """
@@ -510,8 +660,8 @@ def build_tracking_dataset(
 
     Arborescence générée sous ``output_root/`` :
         {train,val,test}/
-            frames_A/         ← images Frame A (.jpg)
-            frames_B/         ← images Frame B (.jpg, même taille que A)
+            frames_A/         ← images Frame A (.jpg, avec artefacts vidéo)
+            frames_B/         ← images Frame B (.jpg, artefacts indépendants de A)
             gt_A/             ← annotations Frame A (.txt)
             gt_B/             ← annotations Frame B (.txt)
             gt_links/         ← liens de correspondance (.txt)
@@ -528,6 +678,15 @@ def build_tracking_dataset(
         shift_range (int) : décalage maximum en pixels entre les deux crops.
             Valeur par défaut 30 px. Représente un "pan" de caméra d'environ
             2 à 5 % de la dimension de l'image selon sa résolution.
+        brightness_jitter (float) : amplitude max de variation de luminosité (±).
+            Valeur par défaut 0.08 → variation de ±8 % autour de la luminosité d'origine.
+            Augmenter pour des transitions lumineuses plus marquées (ex : 0.15).
+        color_jitter (float) : amplitude max du décalage colorimétrique par canal (±).
+            Valeur par défaut 0.05 → chaque canal BGR peut dériver de ±5 %.
+            Augmenter pour des dominantes de couleur plus visibles (ex : 0.10).
+        noise_sigma (float) : écart-type du bruit Gaussien additif sur [0-255].
+            Valeur par défaut 3.0 → bruit fin, imperceptible mais mesurable.
+            Augmenter pour simuler des conditions de faible lumière (ex : 6.0).
         seed (int)        : graine du générateur aléatoire.
             Même seed → même dataset généré (reproductibilité).
 
@@ -569,13 +728,16 @@ def build_tracking_dataset(
             gt_path  = os.path.join(gt_dir,     f"{img_id}.txt")
 
             result = _process_image(
-                img_id       = img_id,
-                img_path     = img_path,
-                gt_path      = gt_path,
-                label_info   = labels[img_id],
-                split_out_dir= split_out_dir,
-                shift_range  = shift_range,
-                rng          = rng,
+                img_id            = img_id,
+                img_path          = img_path,
+                gt_path           = gt_path,
+                label_info        = labels[img_id],
+                split_out_dir     = split_out_dir,
+                shift_range       = shift_range,
+                brightness_jitter = brightness_jitter,
+                color_jitter      = color_jitter,
+                noise_sigma       = noise_sigma,
+                rng               = rng,
             )
 
             if result is not None:
@@ -633,9 +795,12 @@ if __name__ == "__main__":
     print(f"Destination : {OUTPUT_ROOT}")
 
     build_tracking_dataset(
-        data_root   = DATA_ROOT,
-        output_root = OUTPUT_ROOT,
-        splits      = ("train", "val", "test"),
-        shift_range = 30,    # décalage max de 30 pixels entre Frame A et Frame B
-        seed        = 42,    # graine fixe → dataset reproductible
+        data_root         = DATA_ROOT,
+        output_root       = OUTPUT_ROOT,
+        splits            = ("train", "val", "test"),
+        shift_range       = 30,   # décalage max de 30 px entre Frame A et Frame B
+        brightness_jitter = 0.08, # luminosité ±8 % entre les deux frames
+        color_jitter      = 0.05, # dominante colorée ±5 % par canal BGR
+        noise_sigma       = 3.0,  # bruit capteur : écart-type 3 niveaux sur 255
+        seed              = 42,   # graine fixe → dataset reproductible
     )
