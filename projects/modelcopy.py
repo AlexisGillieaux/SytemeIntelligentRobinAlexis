@@ -438,8 +438,8 @@ def train(
         model.train()
         train_loss = 0.0
 
-        for batch in train_loader:
-            print(f"  Epoch {epoch} — Batch {train_loader._index}/{len(train_loader)}", end="\r")
+        for batch_idx, batch in enumerate(train_loader, 1):
+            print(f"  Epoch {epoch} — Batch {batch_idx}/{len(train_loader)}", end="\r")
             # Concaténation des deux frames sur la dimension canal
             # frame_A (B,3,H,W) + frame_B (B,3,H,W) → (B,6,H,W)
             x = torch.cat(
