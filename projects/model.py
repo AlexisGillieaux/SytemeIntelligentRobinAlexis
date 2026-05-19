@@ -542,21 +542,6 @@ def smoke_test(data_root: str, img_size: tuple = (512, 512)) -> None:
     print(f"  Perte initiale : {loss.item():.4f}")
     print("  Smoke test OK")
 
-def predict(image_A, image_B, model_path="crowd_tracking_net.pth", img_size=(512,512)):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Chargement du modèle depuis le fichier .pth
-    model = CrowdTrackingNet(base_ch=32).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-
-    # Préparation des images (resize + tensor)
-    # ...
-
-    with torch.no_grad():
-        pred = model(x)  # (1, 1, H, W)
-
-    return pred.squeeze().cpu().numpy()  # (H, W)
 
 # =============================================================================
 # Point d'entrée
