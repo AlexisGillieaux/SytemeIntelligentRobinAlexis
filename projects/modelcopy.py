@@ -396,9 +396,11 @@ def train(
         save_path   : chemin de sauvegarde du meilleur modèle (.pth).
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Appareil : {device}")
     
     print("test")
+    print(f"Appareil : {device}")
+    
+    
 
     img_h, img_w = img_size
 
@@ -566,7 +568,7 @@ if __name__ == "__main__":
         print("[ERREUR] data_tracking/ introuvable.")
         print("  -> Lancez d'abord : python dataCleaning.py")
     else:
-        smoke_test(TRACKING_ROOT, img_size=(512, 512))
+        # smoke_test(TRACKING_ROOT, img_size=(512, 512))
 
         train(
             data_root  = TRACKING_ROOT,
