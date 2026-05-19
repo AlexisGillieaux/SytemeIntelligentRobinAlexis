@@ -361,6 +361,63 @@ def tracking_loss(
     return (weights * (pred - target) ** 2).mean()
 
 
+def compute_metrics(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    event_threshold: float = 0.3,
+    stayed_threshold: float = 50.0,
+) -> dict:
+    """
+    Calcule des métriques détaillées par type d'événement.
+
+    Returns:
+        dict avec les clés :
+          mse_bg       — MSE sur les pixels de fond (target == 0)
+          mse_events   — MSE sur les pixels d'événement (target != 0)
+          recall_pts   — recall des têtes entered/left (|target| == 1)
+                         = % de pixels d'événement où |pred| > event_threshold
+          iou_stayed   — IoU des traits stayed (target == 255)
+                         entre pred >= stayed_threshold et target == 255
+    """
+    with torch.no_grad():
+        mask_bg     = (target == 0)
+        mask_events = (target != 0)
+        mask_pts    = (target.abs() == 1)    # entered (+1) et left (-1)
+        mask_stayed = (target == 255)
+
+        # MSE fond
+        if mask_bg.any():
+            mse_bg = ((pred[mask_bg] - target[mask_bg]) ** 2).mean().item()
+        else:
+            mse_bg = 0.0
+
+        # MSE événements
+        if mask_events.any():
+            mse_events = ((pred[mask_events] - target[mask_events]) ** 2).mean().item()
+        else:
+            mse_events = 0.0
+
+        # Recall entered/left : parmi les vrais pixels ±1, combien le modèle détecte ?
+        if mask_pts.any():
+            detected = (pred[mask_pts].abs() > event_threshold)
+            recall_pts = detected.float().mean().item()
+        else:
+            recall_pts = float("nan")
+
+        # IoU stayed : chevauchement entre pred >= stayed_threshold et target == 255
+        pred_stayed  = (pred >= stayed_threshold)
+        inter = (pred_stayed & mask_stayed).sum().item()
+        union = (pred_stayed | mask_stayed).sum().item()
+        iou_stayed = inter / union if union > 0 else float("nan")
+
+    return {
+        "mse_bg":     mse_bg,
+        "mse_events": mse_events,
+        "recall_pts": recall_pts,
+        "iou_stayed": iou_stayed,
+    }
+
+
 # =============================================================================
 # Boucle d'entraînement
 # =============================================================================
@@ -464,6 +521,8 @@ def train(
         # ---- Phase validation ----
         model.eval()
         val_loss = 0.0
+        agg = {"mse_bg": 0.0, "mse_events": 0.0, "recall_pts": 0.0, "iou_stayed": 0.0}
+        n_val = 0
         with torch.no_grad():
             for batch in val_loader:
                 x = torch.cat(
@@ -471,15 +530,28 @@ def train(
                      batch["frame_B"].to(device)], dim=1
                 )
                 target = build_target_batch(batch, img_h, img_w, device)
-                val_loss += tracking_loss(model(x), target).item()
+                pred = model(x)
+                val_loss += tracking_loss(pred, target).item()
+                m = compute_metrics(pred, target)
+                for k in agg:
+                    v = m[k]
+                    if not (v != v):  # ignore NaN
+                        agg[k] += v
+                        if k == "mse_bg":
+                            n_val += 1
         val_loss /= len(val_loader)
+        if n_val > 0:
+            for k in agg:
+                agg[k] /= n_val
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         print(
             f"Epoque {epoch:>3}/{epochs}  "
-            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"train={train_loss:.4f}  val={val_loss:.4f}  "
+            f"mse_bg={agg['mse_bg']:.4f}  mse_ev={agg['mse_events']:.2f}  "
+            f"recall_pts={agg['recall_pts']:.3f}  iou_stayed={agg['iou_stayed']:.3f}  "
             f"lr={current_lr:.2e}"
         )
 
