@@ -630,15 +630,15 @@ def smoke_test(data_root: str, img_size: tuple = (512, 512)) -> None:
 
 if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "data_tracking")
+        os.path.join(os.path.dirname(__file__), "..", "data")
     )
     SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net.pth")
 
-    print(f"data_tracking : {TRACKING_ROOT}")
+    print(f"data/ : {TRACKING_ROOT}")
 
     if not os.path.isdir(TRACKING_ROOT):
-        print("[ERREUR] data_tracking/ introuvable.")
-        print("  -> Lancez d'abord : python dataCleaning.py")
+        print("[ERREUR] data/ introuvable.")
+        print("  -> Vérifiez le chemin vers le dataset JHU-CROWD++ original.")
     else:
         # smoke_test(TRACKING_ROOT, img_size=(512, 512))
 

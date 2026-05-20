@@ -43,13 +43,18 @@ Dépendances Python :
 """
 
 import os
+import sys
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+sys.path.insert(0, os.path.dirname(__file__))
+from dataCleaning import _compute_shift, _generate_pair, _apply_video_artifacts
 
 
 # =============================================================================
@@ -797,48 +802,63 @@ class JHUCrowdTrackingDataset(Dataset):
         split: str = "train",
         img_size: tuple | None = None,
         augment: bool = False,
+        shift_range: int = 30,
+        brightness_jitter: float = 0.08,
+        color_jitter_vid: float = 0.05,
+        noise_sigma: float = 3.0,
     ):
         """
-        Initialise le dataset de tracking et charge les métadonnées en mémoire.
+        Initialise le dataset de tracking.
 
-        Les images, annotations et liens sont chargés à la demande dans
-        ``__getitem__`` pour ne pas surcharger la RAM.
+        Les frames A et B sont générées À LA VOLÉE dans __getitem__ à partir
+        des images originales JHU-CROWD++. Chaque epoch voit des paires
+        différentes (shift aléatoire différent).
 
         Args:
             root_dir (str):
-                Chemin vers le dossier ``data_tracking/`` généré par dataCleaning.py.
+                Chemin vers le dossier ``data/`` original (JHU-CROWD++).
+                (Anciennement data_tracking/ — plus besoin de dataCleaning.py)
 
             split (str):
-                Sous-ensemble à utiliser : "train", "val" ou "test".
+                "train", "val" ou "test".
 
             img_size (tuple | None):
-                (H, W) de redimensionnement, ou None pour garder la taille des crops.
-                Fortement recommandé : les crops ont des tailles légèrement variables
-                selon le décalage appliqué → fournir un ``img_size`` fixe garantit
-                des batchs homogènes.
+                (H, W) de redimensionnement. Fortement recommandé car les crops
+                ont des tailles variables selon le shift tiré aléatoirement.
 
             augment (bool):
-                Si True (train uniquement), applique :
-                  - flip horizontal aléatoire (cohérent sur les deux frames)
-                  - perturbation de couleur cohérente (même paramètres pour A et B)
+                Si True (train uniquement), applique un flip horizontal aléatoire
+                et cohérent sur les deux frames.
+
+            shift_range (int):
+                Décalage maximum en pixels entre Frame A et Frame B (défaut 30).
+
+            brightness_jitter (float):
+                Amplitude max de variation de luminosité par frame (±, défaut 0.08).
+
+            color_jitter_vid (float):
+                Amplitude max de décalage colorimétrique par canal (±, défaut 0.05).
+
+            noise_sigma (float):
+                Écart-type du bruit Gaussien additif (défaut 3.0).
         """
         assert split in ("train", "val", "test"), f"Split inconnu : {split}"
 
-        self.root_dir = root_dir
-        self.split    = split
-        self.img_size = img_size
-        # L'augmentation n'est active qu'en entraînement
-        self.augment  = augment and split == "train"
+        self.root_dir          = root_dir
+        self.split             = split
+        self.img_size          = img_size
+        self.augment           = augment and split == "train"
+        self.shift_range       = shift_range
+        self.brightness_jitter = brightness_jitter
+        self.color_jitter_vid  = color_jitter_vid
+        self.noise_sigma       = noise_sigma
 
-        # Chemins des sous-dossiers du split
-        self.frames_A_dir = os.path.join(root_dir, split, "frames_A")
-        self.frames_B_dir = os.path.join(root_dir, split, "frames_B")
-        self.gt_A_dir     = os.path.join(root_dir, split, "gt_A")
-        self.gt_B_dir     = os.path.join(root_dir, split, "gt_B")
-        self.links_dir    = os.path.join(root_dir, split, "gt_links")
-        self.labels_file  = os.path.join(root_dir, split, "image_labels.txt")
+        # Chemins vers les données originales JHU-CROWD++
+        self.images_dir  = os.path.join(root_dir, split, "images")
+        self.gt_dir      = os.path.join(root_dir, split, "gt")
+        self.labels_file = os.path.join(root_dir, split, "image_labels.txt")
 
-        # Lecture des métadonnées (image_labels.txt tracking)
+        # Lecture des métadonnées (image_labels.txt original — 5 colonnes)
         self.image_labels = self._load_image_labels()
         self.image_ids    = list(self.image_labels.keys())
 
@@ -854,41 +874,27 @@ class JHUCrowdTrackingDataset(Dataset):
 
     def _load_image_labels(self) -> dict:
         """
-        Lit le fichier ``image_labels.txt`` du dataset de tracking.
+        Lit le fichier ``image_labels.txt`` original JHU-CROWD++ (5 colonnes).
 
         Format de chaque ligne :
-            id,count_A,count_B,count_stayed,count_left,count_entered,scene,weather,distractor
+            id,count,scene,weather,distractor
         Exemple :
-            0001,161,158,155,6,3,water park,0,0
+            0001,161,water park,0,0
 
         Returns:
-            dict[str, dict] : clés = identifiants d'images (ex : "0001"),
-            valeurs = dicts avec les champs :
-                - "count_A"       (int) : têtes dans Frame A
-                - "count_B"       (int) : têtes dans Frame B
-                - "count_stayed"  (int) : têtes appariées (présentes dans les deux)
-                - "count_left"    (int) : têtes ayant quitté le champ
-                - "count_entered" (int) : têtes ayant rejoint le champ
-                - "scene"         (str) : type de lieu
-                - "weather"       (int) : code météo
-                - "distractor"    (int) : 1 si image distracteur
+            dict[str, dict] avec les champs "count", "scene", "weather", "distractor".
         """
         labels = {}
         with open(self.labels_file, "r") as f:
             for line in f:
                 parts = [p.strip() for p in line.strip().split(",")]
-                # Le format tracking a 9 colonnes
-                if len(parts) < 9:
+                if len(parts) < 5:
                     continue
                 labels[parts[0]] = {
-                    "count_A":       int(parts[1]),
-                    "count_B":       int(parts[2]),
-                    "count_stayed":  int(parts[3]),
-                    "count_left":    int(parts[4]),
-                    "count_entered": int(parts[5]),
-                    "scene":         parts[6],
-                    "weather":       int(parts[7]),
-                    "distractor":    int(parts[8]),
+                    "count":      int(parts[1]),
+                    "scene":      parts[2],
+                    "weather":    int(parts[3]),
+                    "distractor": int(parts[4]),
                 }
         return labels
 
@@ -1045,22 +1051,6 @@ class JHUCrowdTrackingDataset(Dataset):
             # Note : les liens (idx_A, idx_B) ne dépendent pas des coordonnées,
             # ils restent valides après le flip.
 
-        # --- 2. Perturbation de couleur cohérente ---
-        # On calcule UN seul jeu de paramètres aléatoires, appliqué aux deux frames.
-        # TF.adjust_* prend une PIL Image et retourne une PIL Image transformée.
-        brightness = float(np.random.uniform(0.8, 1.2))   # facteur ∈ [0.8, 1.2]
-        contrast   = float(np.random.uniform(0.8, 1.2))
-        saturation = float(np.random.uniform(0.8, 1.2))
-
-        # Application dans un ordre fixe (brightness → contrast → saturation)
-        img_A = TF.adjust_brightness(img_A, brightness)
-        img_A = TF.adjust_contrast(img_A, contrast)
-        img_A = TF.adjust_saturation(img_A, saturation)
-
-        img_B = TF.adjust_brightness(img_B, brightness)
-        img_B = TF.adjust_contrast(img_B, contrast)
-        img_B = TF.adjust_saturation(img_B, saturation)
-
         return img_A, img_B, anns_A, anns_B
 
     # -------------------------------------------------------------------------
@@ -1111,75 +1101,89 @@ class JHUCrowdTrackingDataset(Dataset):
         img_id     = self.image_ids[idx]
         label_info = self.image_labels[img_id]
 
-        # --- Chargement des deux images ---
-        img_A = Image.open(
-            os.path.join(self.frames_A_dir, f"{img_id}.jpg")
-        ).convert("RGB")
-        img_B = Image.open(
-            os.path.join(self.frames_B_dir, f"{img_id}.jpg")
-        ).convert("RGB")
+        # --- Chargement de l'image originale (BGR) ---
+        img_path  = os.path.join(self.images_dir, f"{img_id}.jpg")
+        image_bgr = cv2.imread(img_path)
+        if image_bgr is None:
+            raise FileNotFoundError(f"Image introuvable : {img_path}")
+        orig_h, orig_w = image_bgr.shape[:2]
 
-        # Les deux frames ont la même taille (même crop shift)
-        orig_w, orig_h = img_A.size  # PIL renvoie (largeur, hauteur)
+        # --- Génération du shift aléatoire à la volée ---
+        # Chaque appel produit un shift différent → diversité entre époques
+        rng = np.random.default_rng()
+        dx, dy = _compute_shift(orig_w, orig_h, self.shift_range, rng)
 
-        # --- Chargement des annotations et des liens ---
-        anns_A = self._load_gt_file(os.path.join(self.gt_A_dir,  f"{img_id}.txt"))
-        anns_B = self._load_gt_file(os.path.join(self.gt_B_dir,  f"{img_id}.txt"))
-        links  = self._load_links_file(os.path.join(self.links_dir, f"{img_id}.txt"))
+        # --- Création des deux crops ---
+        frame_A_bgr = image_bgr[0:orig_h - dy, 0:orig_w - dx].copy()
+        frame_B_bgr = image_bgr[dy:orig_h,     dx:orig_w    ].copy()
 
-        # --- Augmentation (entraînement uniquement) ---
+        # --- Artefacts vidéo indépendants (bruit, luminosité, couleur) ---
+        frame_A_bgr = _apply_video_artifacts(
+            frame_A_bgr, rng, self.brightness_jitter, self.color_jitter_vid, self.noise_sigma
+        )
+        frame_B_bgr = _apply_video_artifacts(
+            frame_B_bgr, rng, self.brightness_jitter, self.color_jitter_vid, self.noise_sigma
+        )
+
+        # --- Génération des annotations à la volée ---
+        anns  = self._load_gt_file(os.path.join(self.gt_dir, f"{img_id}.txt"))
+        gt_A, gt_B, links = _generate_pair(anns, dx, dy, orig_w, orig_h)
+
+        # --- BGR → PIL RGB (pour flip et transforms PyTorch) ---
+        img_A = Image.fromarray(cv2.cvtColor(frame_A_bgr, cv2.COLOR_BGR2RGB))
+        img_B = Image.fromarray(cv2.cvtColor(frame_B_bgr, cv2.COLOR_BGR2RGB))
+
+        # --- Flip horizontal aléatoire cohérent (entraînement uniquement) ---
         if self.augment:
-            img_A, img_B, anns_A, anns_B = self._apply_augmentation(
-                img_A, img_B, anns_A, anns_B
+            img_A, img_B, gt_A, gt_B = self._apply_augmentation(
+                img_A, img_B, gt_A, gt_B
             )
 
         # --- Redimensionnement ---
+        crop_w, crop_h = orig_w - dx, orig_h - dy
         if self.img_size is not None:
             out_h, out_w = self.img_size
-            # PIL.Image.resize prend (largeur, hauteur) — ordre inverse de img_size
             img_A = img_A.resize((out_w, out_h), Image.BILINEAR)
             img_B = img_B.resize((out_w, out_h), Image.BILINEAR)
         else:
-            out_h, out_w = orig_h, orig_w
+            out_h, out_w = crop_h, crop_w
 
         # --- Facteurs d'échelle pour les coordonnées des boîtes ---
-        # Si on a redimensionné l'image, on doit aussi mettre à l'échelle
-        # les coordonnées des annotations (elles étaient en pixels originaux)
-        scale_x = out_w / orig_w
-        scale_y = out_h / orig_h
+        scale_x = out_w / crop_w
+        scale_y = out_h / crop_h
 
-        # --- Conversion PIL Image → Tensor PyTorch normalisé ---
-        # ToTensor :  PIL (H,W,3) uint8 [0-255] → Tensor (3,H,W) float32 [0-1]
-        # normalize : soustrait moyenne ImageNet, divise par écart-type
+        # --- Conversion PIL → Tensor normalisé ---
         tensor_A = self.normalize(transforms.ToTensor()(img_A))
         tensor_B = self.normalize(transforms.ToTensor()(img_B))
 
-        # --- Conversion annotations → boîtes englobantes xyxy ---
-        boxes_A = self._anns_to_boxes(anns_A, scale_x, scale_y)
-        boxes_B = self._anns_to_boxes(anns_B, scale_x, scale_y)
+        # --- Annotations → boîtes xyxy mises à l'échelle ---
+        boxes_A = self._anns_to_boxes(gt_A, scale_x, scale_y)
+        boxes_B = self._anns_to_boxes(gt_B, scale_x, scale_y)
 
-        # --- Conversion liens → Tensor (L, 2) ---
-        # Chaque ligne = [idx_tête_dans_boxes_A, idx_tête_dans_boxes_B]
+        # --- Liens → Tensor (L, 2) ---
         if links:
-            links_tensor = torch.tensor(links, dtype=torch.long)  # (L, 2)
+            links_tensor = torch.tensor(links, dtype=torch.long)
         else:
-            # Aucune correspondance (image sans personnes ou toutes parties)
             links_tensor = torch.zeros((0, 2), dtype=torch.long)
 
+        count_stayed  = len(links)
+        count_A       = len(gt_A)
+        count_B       = len(gt_B)
+
         return {
-            "frame_A":       tensor_A,                   # Tensor (3, H, W)
-            "frame_B":       tensor_B,                   # Tensor (3, H, W)
-            "boxes_A":       boxes_A,                    # Tensor (N_A, 4) xyxy
-            "boxes_B":       boxes_B,                    # Tensor (N_B, 4) xyxy
-            "links":         links_tensor,               # Tensor (L, 2)   [idx_A, idx_B]
-            "count_A":       label_info["count_A"],      # int
-            "count_B":       label_info["count_B"],      # int
-            "count_stayed":  label_info["count_stayed"], # int
-            "count_left":    label_info["count_left"],   # int
-            "count_entered": label_info["count_entered"],# int
-            "image_id":      img_id,                     # str
-            "scene":         label_info["scene"],        # str
-            "weather":       label_info["weather"],      # int
+            "frame_A":       tensor_A,
+            "frame_B":       tensor_B,
+            "boxes_A":       boxes_A,
+            "boxes_B":       boxes_B,
+            "links":         links_tensor,
+            "count_A":       count_A,
+            "count_B":       count_B,
+            "count_stayed":  count_stayed,
+            "count_left":    count_A - count_stayed,
+            "count_entered": count_B - count_stayed,
+            "image_id":      img_id,
+            "scene":         label_info["scene"],
+            "weather":       label_info["weather"],
         }
 
 
@@ -1246,6 +1250,10 @@ def get_tracking_dataloader(
     augment: bool = True,
     num_workers: int = 0,
     shuffle: bool | None = None,
+    shift_range: int = 30,
+    brightness_jitter: float = 0.08,
+    color_jitter_vid: float = 0.05,
+    noise_sigma: float = 3.0,
 ) -> tuple[DataLoader, JHUCrowdTrackingDataset]:
     """
     Crée et retourne un DataLoader PyTorch pour le dataset de tracking.
@@ -1297,10 +1305,14 @@ def get_tracking_dataloader(
         shuffle = split == "train"
 
     dataset = JHUCrowdTrackingDataset(
-        root_dir = data_root,
-        split    = split,
-        img_size = img_size,
-        augment  = augment,
+        root_dir          = data_root,
+        split             = split,
+        img_size          = img_size,
+        augment           = augment,
+        shift_range       = shift_range,
+        brightness_jitter = brightness_jitter,
+        color_jitter_vid  = color_jitter_vid,
+        noise_sigma       = noise_sigma,
     )
 
     loader = DataLoader(
