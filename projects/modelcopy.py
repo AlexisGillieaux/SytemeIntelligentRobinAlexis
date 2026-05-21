@@ -635,7 +635,7 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net.pth")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net2.pth")
 
     print(f"data/ : {TRACKING_ROOT}")
 
