@@ -14,16 +14,15 @@ Problème à résoudre :
     En résumé : le modèle répond à la question
     "que s'est-il passé entre Frame A et Frame B, pixel par pixel ?"
 
-Architecture choisie : U-Net (encodeur-décodeur avec skip connections)
-    • Entrée  : Frame A et Frame B concaténées → (B, 6, H, W)
-    • Sortie  : carte de tracking              → (B, 1, H, W)
+Architecture choisie : U-Net Siamois (encodeur partagé + décodeur fusionné)
+    • Entrée  : Frame A (B, 3, H, W) et Frame B (B, 3, H, W) séparées
+    • Sortie  : carte de tracking (B, 1, H, W)
 
-    Pourquoi U-Net ?
-        Le SimpleCNN original était un classifieur global (une classe pour toute
-        l'image).  Ici, la tâche est de la prédiction DENSE (on doit annoter
-        chaque pixel).  U-Net est l'architecture standard pour ce type de
-        tâche : l'encodeur extrait les features, le décodeur les reprojette
-        à la résolution d'origine grâce aux skip connections.
+    Différence avec modelcopy.py (U-Net classique 6ch) :
+        Ici chaque frame passe dans le MÊME encodeur (poids partagés).
+        Les features sont fusionnées par concaténation au bottleneck et
+        dans chaque skip connection.  Le décodeur traite donc des features
+        qui représentent explicitement les deux frames comparées.
 
 Données utilisées :
     Générées par dataCleaning.build_tracking_dataset → data_tracking/
@@ -207,120 +206,116 @@ def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
 
 
 # =============================================================================
-# Architecture principale : CrowdTrackingNet
+# Architecture principale : SiameseCrowdTrackingNet
 # =============================================================================
 
 class CrowdTrackingNet(nn.Module):
     """
-    Réseau encodeur-décodeur (U-Net) pour le tracking de foule entre deux frames.
+    U-Net Siamois pour le tracking de foule.
 
-    Architecture :
+    Principe : Frame A et Frame B passent chacune dans le MÊME encodeur
+    (poids partagés).  Les features des deux branches sont concaténées
+    au bottleneck ET dans chaque skip connection, puis le décodeur
+    reconstruit la carte de tracking à partir de cette fusion.
 
-        Input (B, 6, H, W)           ← Frame A + Frame B concaténées
-             │
-        ┌────▼────┐  enc1 (32)   ──────────────────────────────────┐ skip 1
-        │  pool   │                                                  │
-        ├────▼────┤  enc2 (64)   ─────────────────────────────┐ skip 2
-        │  pool   │                                             │
-        ├────▼────┤  enc3 (128)  ────────────────────────┐ skip 3
-        │  pool   │                                       │
-        ├────▼────┤  enc4 (256)  ───────────────────┐ skip 4
-        │  pool   │                                  │
-        ├────▼────┤  bottleneck (512)                │
-        │  up4    │──────────────────────── cat skip4 ┘
-        ├────▼────┤  dec4 (256)
-        │  up3    │───────────────────── cat skip3 ┘
-        ├────▼────┤  dec3 (128)
-        │  up2    │────────────────── cat skip2 ┘
-        ├────▼────┤  dec2 (64)
-        │  up1    │─────────────── cat skip1 ┘
-        ├────▼────┤  dec1 (32)
-        │  head   │  Conv 1×1 → 1 canal (pas d'activation)
-        └────▼────┘
-        Output (B, 1, H, W)          ← carte de tracking
+    Avantage vs U-Net 6ch (modelcopy) :
+        L'encodeur partagé apprend des features indépendantes de quelle
+        frame il traite.  La comparaison A↔B se fait explicitement par
+        concaténation, au lieu d'être implicite dans les 6 canaux d'entrée.
 
-    Pourquoi sans activation finale ?
-        La sortie doit couvrir {-1, 0, 1, 255}.  Une sigmoid sortirait [0,1],
-        une tanh sortirait [-1,1] — aucune ne peut atteindre 255.
-        On laisse donc la convolution finale linéaire et on laisse la perte
-        guider le réseau vers les bonnes valeurs.
+    Architecture (base_ch=32) :
+
+        Frame A (B,3,H,W) ──► enc1(32)──► enc2(64)──► enc3(128)──► enc4(256)
+                                  │            │             │            │
+        Frame B (B,3,H,W) ──► enc1(32)──► enc2(64)──► enc3(128)──► enc4(256)
+                             (poids partagés sur toute la colonne)
+                                  │            │             │            │
+                               skip1(64)   skip2(128)   skip3(256)   skip4(512)
+                                                                         │
+                                                              bottleneck(512→512)
+                                                                         │
+                              up4(256) + skip4(512) → dec4(768→256)
+                              up3(128) + skip3(256) → dec3(384→128)
+                              up2( 64) + skip2(128) → dec2(192→ 64)
+                              up1( 32) + skip1( 64) → dec1( 96→ 32)
+                                                       head(32→1)
+                                                    Output (B,1,H,W)
     """
 
     def __init__(self, base_ch: int = 32):
-        """
-        Args:
-            base_ch (int) :
-                Nombre de filtres au premier niveau de l'encodeur.
-                Les niveaux suivants ont 2×, 4×, 8×, 16× filtres.
-                • base_ch=16 : ~2 M paramètres — entraînable sur CPU lent / GPU modeste.
-                • base_ch=32 : ~8 M paramètres — recommandé (défaut).
-                • base_ch=64 : ~32 M paramètres — GPU avec ≥ 8 Go VRAM.
-        """
         super().__init__()
 
-        # ---- Encodeur (chemin descendant) --------------------------------
-        # MaxPool2d(2,2) divise H et W par 2 entre chaque niveau.
-        self.enc1 = _conv_block(6,          base_ch)       # → (B,  32, H,    W)
-        self.enc2 = _conv_block(base_ch,    base_ch * 2)   # → (B,  64, H/2,  W/2)
-        self.enc3 = _conv_block(base_ch*2,  base_ch * 4)   # → (B, 128, H/4,  W/4)
-        self.enc4 = _conv_block(base_ch*4,  base_ch * 8)   # → (B, 256, H/8,  W/8)
+        # ---- Encodeur partagé (utilisé deux fois : pour A et pour B) -----
+        self.enc1 = _conv_block(3,         base_ch)      # (B, 32,  H,    W)
+        self.enc2 = _conv_block(base_ch,   base_ch * 2)  # (B, 64,  H/2,  W/2)
+        self.enc3 = _conv_block(base_ch*2, base_ch * 4)  # (B, 128, H/4,  W/4)
+        self.enc4 = _conv_block(base_ch*4, base_ch * 8)  # (B, 256, H/8,  W/8)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        # ---- Goulot d'étranglement (bottleneck) --------------------------
-        # Niveau le plus profond : champ réceptif maximal, représentation
-        # la plus abstraite (relations globales entre les deux frames).
-        self.bottleneck = _conv_block(base_ch*8, base_ch*16)  # → (B, 512, H/16, W/16)
+        # ---- Bottleneck --------------------------------------------------
+        # Entrée : concat(pool(e4_A), pool(e4_B)) = base_ch*16 canaux
+        self.bottleneck = _conv_block(base_ch*16, base_ch*16)  # 512→512
 
-        # ---- Décodeur (chemin ascendant) ---------------------------------
-        # ConvTranspose2d : upsampling ×2 "appris" (contrairement à bilinear).
-        # Après chaque upsampling, on concatène avec les features de l'encodeur
-        # (skip connection) pour récupérer les détails spatiaux fins.
-
+        # ---- Décodeur ----------------------------------------------------
+        # Les skips sont 2× plus larges car on concatène A et B.
+        # Notation : up_out + skip = entrée dec
+        #   dec4 : base_ch*8 + base_ch*16 = base_ch*24  (256+512=768)
+        #   dec3 : base_ch*4 + base_ch* 8 = base_ch*12  (128+256=384)
+        #   dec2 : base_ch*2 + base_ch* 4 = base_ch* 6  ( 64+128=192)
+        #   dec1 : base_ch   + base_ch* 2 = base_ch* 3  ( 32+ 64= 96)
         self.up4  = nn.ConvTranspose2d(base_ch*16, base_ch*8,  kernel_size=2, stride=2)
-        self.dec4 = _conv_block(base_ch*16, base_ch*8)   # 16× = up(8×) + skip(8×)
+        self.dec4 = _conv_block(base_ch*24, base_ch*8)
 
         self.up3  = nn.ConvTranspose2d(base_ch*8,  base_ch*4,  kernel_size=2, stride=2)
-        self.dec3 = _conv_block(base_ch*8,  base_ch*4)
+        self.dec3 = _conv_block(base_ch*12, base_ch*4)
 
         self.up2  = nn.ConvTranspose2d(base_ch*4,  base_ch*2,  kernel_size=2, stride=2)
-        self.dec2 = _conv_block(base_ch*4,  base_ch*2)
+        self.dec2 = _conv_block(base_ch*6,  base_ch*2)
 
         self.up1  = nn.ConvTranspose2d(base_ch*2,  base_ch,    kernel_size=2, stride=2)
-        self.dec1 = _conv_block(base_ch*2,  base_ch)
+        self.dec1 = _conv_block(base_ch*3,  base_ch)
 
-        # ---- Projection finale : N canaux → 1 canal ----------------------
-        # kernel_size=1 : "convolution pointwise" — mélange les canaux sans
-        # toucher au voisinage spatial.  Pas d'activation : sortie linéaire.
         self.head = nn.Conv2d(base_ch, 1, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Passe avant du réseau.
+    def _encode(self, x: torch.Tensor):
+        """Passe une frame (B,3,H,W) dans l'encodeur partagé."""
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        return e1, e2, e3, e4
 
+    def forward(self, frame_A: torch.Tensor, frame_B: torch.Tensor) -> torch.Tensor:
+        """
         Args:
-            x (Tensor) : (B, 6, H, W) — Frame A et Frame B concaténées.
-                         Les 3 premiers canaux sont Frame A, les 3 suivants Frame B.
+            frame_A : (B, 3, H, W)
+            frame_B : (B, 3, H, W)
 
         Returns:
             Tensor (B, 1, H, W) — carte de tracking prédite.
         """
-        # ---- Encodeur : extraction des features à plusieurs échelles ----
-        e1 = self.enc1(x)                # (B,  32, H,    W)   — textures fines
-        e2 = self.enc2(self.pool(e1))    # (B,  64, H/2,  W/2) — formes locales
-        e3 = self.enc3(self.pool(e2))    # (B, 128, H/4,  W/4) — parties de corps
-        e4 = self.enc4(self.pool(e3))    # (B, 256, H/8,  W/8) — objets entiers
+        # ---- Encodage séparé des deux frames (poids partagés) ----
+        e1_A, e2_A, e3_A, e4_A = self._encode(frame_A)
+        e1_B, e2_B, e3_B, e4_B = self._encode(frame_B)
 
-        # ---- Bottleneck : représentation globale la plus compressée ----
-        b  = self.bottleneck(self.pool(e4))  # (B, 512, H/16, W/16)
+        # ---- Fusion au bottleneck ----
+        b = self.bottleneck(
+            torch.cat([self.pool(e4_A), self.pool(e4_B)], dim=1)
+        )  # (B, 512, H/16, W/16)
 
-        # ---- Décodeur : reconstruction progressive avec skip connections ----
-        # torch.cat(..., dim=1) fusionne sur la dimension canal
-        d4 = self.dec4(torch.cat([self.up4(b),  e4], dim=1))  # (B, 256, H/8, W/8)
-        d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))  # (B, 128, H/4, W/4)
-        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))  # (B,  64, H/2, W/2)
-        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))  # (B,  32, H,   W)
+        # ---- Skip connections doublées (concat A+B à chaque niveau) ----
+        skip4 = torch.cat([e4_A, e4_B], dim=1)  # (B, 512, H/8,  W/8)
+        skip3 = torch.cat([e3_A, e3_B], dim=1)  # (B, 256, H/4,  W/4)
+        skip2 = torch.cat([e2_A, e2_B], dim=1)  # (B, 128, H/2,  W/2)
+        skip1 = torch.cat([e1_A, e1_B], dim=1)  # (B,  64, H,    W)
 
-        return self.head(d1)   # (B, 1, H, W)
+        # ---- Décodeur ----
+        d4 = self.dec4(torch.cat([self.up4(b),  skip4], dim=1))
+        d3 = self.dec3(torch.cat([self.up3(d4), skip3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), skip2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), skip1], dim=1))
+
+        return self.head(d1)  # (B, 1, H, W)
 
 
 # =============================================================================
@@ -500,17 +495,12 @@ def train(
 
         for batch_idx, batch in enumerate(train_loader, 1):
             print(f"  Epoch {epoch} — Batch {batch_idx}/{len(train_loader)}", end="\r")
-            # Concaténation des deux frames sur la dimension canal
-            # frame_A (B,3,H,W) + frame_B (B,3,H,W) → (B,6,H,W)
-            x = torch.cat(
-                [batch["frame_A"].to(device),
-                 batch["frame_B"].to(device)], dim=1
-            )
+            frame_A = batch["frame_A"].to(device)  # (B, 3, H, W)
+            frame_B = batch["frame_B"].to(device)  # (B, 3, H, W)
 
-            # Cartes cibles générées à la volée depuis les annotations
             target = build_target_batch(batch, img_h, img_w, device)
 
-            pred = model(x)
+            pred = model(frame_A, frame_B)
             loss = tracking_loss(pred, target)
 
             optimizer.zero_grad()
@@ -528,12 +518,10 @@ def train(
         n_val = 0
         with torch.no_grad():
             for batch in val_loader:
-                x = torch.cat(
-                    [batch["frame_A"].to(device),
-                     batch["frame_B"].to(device)], dim=1
-                )
+                frame_A = batch["frame_A"].to(device)
+                frame_B = batch["frame_B"].to(device)
                 target = build_target_batch(batch, img_h, img_w, device)
-                pred = model(x)
+                pred = model(frame_A, frame_B)
                 val_loss += tracking_loss(pred, target).item()
                 m = compute_metrics(pred, target)
                 for k in agg:
@@ -598,14 +586,14 @@ def smoke_test(data_root: str, img_size: tuple = (512, 512)) -> None:
     batch = next(iter(loader))
 
     # ---- Entrée ----
-    x = torch.cat([batch["frame_A"], batch["frame_B"]], dim=1).to(device)
-    print(f"  Input  : {tuple(x.shape)}  (B, 6, H, W)")
+    frame_A = batch["frame_A"].to(device)
+    frame_B = batch["frame_B"].to(device)
+    print(f"  Input  : frame_A {tuple(frame_A.shape)}  frame_B {tuple(frame_B.shape)}")
 
     # ---- Target ----
     target = build_target_batch(batch, img_h, img_w, device)
     print(f"  Target : {tuple(target.shape)}  (B, 1, H, W)")
 
-    # Valeurs présentes dans la carte cible (doit contenir certains {-1, 1, 255})
     unique = sorted({round(v, 0) for v in torch.unique(target).tolist()})
     print(f"  Valeurs cibles : {unique}")
 
@@ -613,7 +601,7 @@ def smoke_test(data_root: str, img_size: tuple = (512, 512)) -> None:
     model = CrowdTrackingNet(base_ch=32).to(device)
     model.eval()
     with torch.no_grad():
-        pred = model(x)
+        pred = model(frame_A, frame_B)
 
     print(f"  Output : {tuple(pred.shape)}  (B, 1, H, W)")
     print(f"  Plage sortie : [{pred.min().item():.3f},  {pred.max().item():.3f}]")
@@ -635,7 +623,7 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net.pth")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net_siamese.pth")
 
     print(f"data/ : {TRACKING_ROOT}")
 

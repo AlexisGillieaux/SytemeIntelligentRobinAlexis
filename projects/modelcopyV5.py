@@ -34,6 +34,7 @@ Dépendances :
 """
 
 import os
+import random
 import sys
 
 import cv2
@@ -41,11 +42,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Import du DataLoader depuis dataGathering.py (même dossier)
 sys.path.insert(0, os.path.dirname(__file__))
 from dataGathering import get_tracking_dataloader
+
+# Valeur cible pour les pixels "stayed" (normalisée depuis 255 → 2).
+# Raison : avec target=255, (pred-255)²=65025 écraserait tout le gradient,
+# le modèle n'apprendrait jamais les têtes entered/left (valeur ±1).
+STAYED_VAL = 2.0
 
 
 # =============================================================================
@@ -107,7 +113,7 @@ def make_target_map(
         cv2.line(target,
                  (x_B + dx, y_B + dy),   # position précédente (Frame A)
                  (x_B,      y_B),         # position actuelle   (Frame B)
-                 color=255.0, thickness=1)
+                 color=STAYED_VAL, thickness=1)
 
     # ---- Entered : point +1 à la position de la tête dans Frame B ----
     for i, a in enumerate(gt_B):
@@ -331,25 +337,23 @@ def tracking_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     w_bg: float = 1.0,
-    w_stayed: float = 5.0,
+    w_stayed: float = 10.0,
     w_pts: float = 200.0,
 ) -> torch.Tensor:
     """
     MSE pondérée avec poids séparés par type d'événement.
 
-    Pourquoi des poids différents ?
-        • fond (0)       : majorité absolue des pixels → poids faible (1)
-        • stayed (255)   : traits de plusieurs pixels chacun → présence non négligeable
-                           mais valeur 255 crée déjà un fort signal MSE → poids modéré (5)
-        • pts (±1)       : un seul pixel par tête entered/left → extrêmement rare
-                           ET valeur faible (±1) → signal MSE minuscule sans pondération
-                           → poids très élevé (200) pour forcer le réseau à les apprendre
+    Valeurs cibles : 0 (fond), STAYED_VAL=2 (stayed), ±1 (entered/left).
+    Avec stayed=2 et pts=±1 :
+        - stayed MSE max : 2² = 4   → ×10 = 40
+        - pts    MSE max : 1² = 1   → ×200 = 200 (pts = pixel unique, besoin fort signal)
+        - bg     MSE    :            → ×1   (pénalise les fausses alarmes)
 
     Args:
         pred     : sortie du modèle (B, 1, H, W).
         target   : carte cible      (B, 1, H, W).
         w_bg     : poids des pixels de fond (valeur 0).
-        w_stayed : poids des pixels de trajectoires stayed (valeur 255).
+        w_stayed : poids des pixels de trajectoires stayed (valeur STAYED_VAL).
         w_pts    : poids des pixels entered (+1) et left (-1).
 
     Returns:
@@ -368,7 +372,7 @@ def compute_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
     event_threshold: float = 0.3,
-    stayed_threshold: float = 50.0,
+    stayed_threshold: float = STAYED_VAL * 0.5,
 ) -> dict:
     """
     Calcule des métriques détaillées par type d'événement.
@@ -419,6 +423,162 @@ def compute_metrics(
         "recall_pts": recall_pts,
         "iou_stayed": iou_stayed,
     }
+
+
+# =============================================================================
+# Visualisation des prédictions
+# =============================================================================
+
+def _colorize_map(arr: np.ndarray, is_prediction: bool = False) -> np.ndarray:
+    """
+    Convertit une carte (H, W) float en image BGR (H, W, 3) uint8.
+        Stayed  → blanc  (255, 255, 255)
+        Entered → vert   (  0, 255,   0)
+        Left    → rouge  (  0,   0, 255)
+        Fond    → noir   (  0,   0,   0)
+    Pour les prédictions, seuillage souple ; pour la target, seuillage strict.
+    """
+    h, w = arr.shape
+    bgr = np.zeros((h, w, 3), dtype=np.uint8)
+
+    if is_prediction:
+        stayed_mask  = arr >= STAYED_VAL * 0.5
+        entered_mask = (arr > 0.3) & ~stayed_mask
+        left_mask    = arr < -0.3
+    else:
+        stayed_mask  = arr >= STAYED_VAL * 0.5
+        entered_mask = (arr > 0.5) & ~stayed_mask
+        left_mask    = arr < -0.5
+
+    bgr[stayed_mask]  = (255, 255, 255)
+    bgr[entered_mask] = (0, 255, 0)
+    bgr[left_mask]    = (0, 0, 255)
+    return bgr
+
+
+def visualize_predictions(
+    model_path: str,
+    data_root: str,
+    output_dir: str,
+    img_size: tuple = (512, 512),
+    n_samples: int = 8,
+    base_ch: int = 32,
+    split: str = "test",
+    indices: list[int] | None = None,
+) -> None:
+    """
+    Charge le modèle entraîné et sauvegarde des images de débogage côte à côte :
+        Frame A  |  Frame B  |  Target (colorisée)  |  Prédiction (seuillée)  |  Prédiction (brute)
+
+    Légende couleurs : blanc = stayed, vert = entered, rouge = left.
+
+    Les images sont tirées aléatoirement dans le split (sans charger tout le dataset)
+    sauf si `indices` est fourni explicitement.
+
+    Args:
+        model_path : chemin vers le fichier .pth sauvegardé pendant l'entraînement.
+        data_root  : chemin vers data/.
+        output_dir : dossier où sauvegarder les images PNG.
+        n_samples  : nombre d'images à visualiser (ignoré si indices est fourni).
+        base_ch    : doit correspondre à la valeur utilisée pendant l'entraînement.
+        split      : "train", "val" ou "test" — split source des images.
+        indices    : liste d'indices précis dans le dataset, ou None pour tirage aléatoire.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    img_h, img_w = img_size
+
+    model = CrowdTrackingNet(base_ch=base_ch).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    print(f"Modèle chargé depuis : {model_path}")
+
+    # On charge uniquement les métadonnées (pas les images) pour connaître la taille
+    _, dataset = get_tracking_dataloader(
+        data_root, split=split, batch_size=1,
+        img_size=img_size, augment=False, num_workers=0,
+    )
+
+    # Sélection des indices : fournis explicitement ou tirage aléatoire sans remise
+    if indices is not None:
+        selected = indices
+    else:
+        n = min(n_samples, len(dataset))
+        selected = random.sample(range(len(dataset)), n)
+
+    print(f"Visualisation de {len(selected)} images (split={split}) : indices {selected}")
+
+    for sample_num, ds_idx in enumerate(selected):
+        # Chargement d'un seul exemple par accès direct au dataset (pas d'itérateur)
+        sample = dataset[ds_idx]
+
+        # Reconstruction d'un batch de taille 1 (ajout de la dimension batch)
+        batch = {
+            "frame_A": sample["frame_A"].unsqueeze(0),
+            "frame_B": sample["frame_B"].unsqueeze(0),
+            "boxes_A": [sample["boxes_A"]],
+            "boxes_B": [sample["boxes_B"]],
+            "links":   [sample["links"]],
+        }
+
+        x      = torch.cat([batch["frame_A"].to(device), batch["frame_B"].to(device)], dim=1)
+        target = build_target_batch(batch, img_h, img_w, device)
+
+        with torch.no_grad():
+            pred = model(x)
+
+        # Tenseurs → numpy pour affichage
+        frame_a = batch["frame_A"][0].permute(1, 2, 0).numpy()  # (H, W, 3) float
+        frame_b = batch["frame_B"][0].permute(1, 2, 0).numpy()
+        tgt_map  = target[0, 0].cpu().numpy()                    # (H, W) float
+        pred_map = pred[0, 0].cpu().numpy()
+
+        # Frames normalisées [0,1] → BGR uint8
+        def to_bgr(arr):
+            arr = np.clip(arr, 0.0, 1.0)
+            return cv2.cvtColor((arr * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+        fa_bgr = to_bgr(frame_a)
+        fb_bgr = to_bgr(frame_b)
+
+        # Cartes colorisées
+        tgt_color   = _colorize_map(tgt_map,  is_prediction=False)
+        pred_thresh = _colorize_map(pred_map, is_prediction=True)
+
+        # Prédiction brute normalisée → heatmap
+        p_min, p_max = pred_map.min(), pred_map.max()
+        if p_max > p_min:
+            pred_norm = (pred_map - p_min) / (p_max - p_min)
+        else:
+            pred_norm = np.zeros_like(pred_map)
+        pred_heat = cv2.applyColorMap((pred_norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+        def add_label(img, text):
+            out = img.copy()
+            cv2.putText(out, text, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            return out
+
+        panels = [
+            add_label(fa_bgr,      "Frame A"),
+            add_label(fb_bgr,      "Frame B"),
+            add_label(tgt_color,   "Target"),
+            add_label(pred_thresh, "Pred (seuil)"),
+            add_label(pred_heat,   f"Pred brute [{p_min:.2f},{p_max:.2f}]"),
+        ]
+        combined = np.concatenate(panels, axis=1)
+
+        # Métriques de l'échantillon
+        m = compute_metrics(pred, target)
+        stats = (f"recall={m['recall_pts']:.3f}  iou={m['iou_stayed']:.3f}  "
+                 f"mse_bg={m['mse_bg']:.2f}  mse_ev={m['mse_events']:.1f}")
+        cv2.putText(combined, stats, (8, img_h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+
+        out_path = os.path.join(output_dir, f"sample_{ds_idx:04d}.png")
+        cv2.imwrite(out_path, combined)
+        print(f"  [{sample_num+1}/{len(selected)}] idx={ds_idx} → {out_path}  recall={m['recall_pts']:.3f} iou={m['iou_stayed']:.3f}")
+
+    print(f"\nVisualisations sauvegardées dans : {output_dir}")
 
 
 # =============================================================================
@@ -487,9 +647,10 @@ def train(
 
     optimizer = Adam(model.parameters(), lr=lr)
     # Réduit le lr ×0.5 toutes les 5 époques pour affiner progressivement
-    scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler =CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float("inf")
+    best_score    = -float("inf")   # recall_pts + iou_stayed (composite, plus élevé = mieux)
 
     for epoch in range(1, epochs + 1):
         print(f"\nEpoque {epoch}/{epochs}  —  LR : {scheduler.get_last_lr()[0]:.2e}")
@@ -515,6 +676,7 @@ def train(
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -558,13 +720,19 @@ def train(
             f"lr={current_lr:.2e}"
         )
 
-        # Sauvegarde du meilleur modèle (critère : val_loss minimale)
-        if val_loss < best_val_loss:
+        # Sauvegarde du meilleur modèle (critère composite : recall_pts + iou_stayed)
+        r   = agg["recall_pts"]
+        iou = agg["iou_stayed"]
+        r_valid   = r   if r   == r   else 0.0   # NaN → 0
+        iou_valid = iou if iou == iou else 0.0
+        score = r_valid + iou_valid
+        if score > best_score:
+            best_score    = score
             best_val_loss = val_loss
             torch.save(model.state_dict(), save_path)
-            print(f"  -> Sauvegarde : {save_path}  (val_loss={val_loss:.4f})")
+            print(f"  -> Sauvegarde : {save_path}  (score={score:.4f}: recall={r_valid:.3f} iou={iou_valid:.3f})")
 
-    print(f"\nEntraînement termine. Meilleure val_loss : {best_val_loss:.4f}")
+    print(f"\nEntraînement terminé. Meilleur score : {best_score:.4f}  (val_loss assoc. : {best_val_loss:.4f})")
 
 
 # =============================================================================
@@ -636,15 +804,20 @@ if __name__ == "__main__":
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
     SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net.pth")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations")
+
+    # Changer MODE pour basculer entre entraînement et visualisation
+    # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
+    # "visualize" → charge le checkpoint et génère des images de débogage dans VIZ_DIR
+    MODE = "train"
 
     print(f"data/ : {TRACKING_ROOT}")
 
     if not os.path.isdir(TRACKING_ROOT):
         print("[ERREUR] data/ introuvable.")
         print("  -> Vérifiez le chemin vers le dataset JHU-CROWD++ original.")
-    else:
+    elif MODE == "train":
         # smoke_test(TRACKING_ROOT, img_size=(512, 512))
-
         train(
             data_root  = TRACKING_ROOT,
             img_size   = (512, 512),
@@ -655,3 +828,18 @@ if __name__ == "__main__":
             num_workers= 0,
             save_path  = SAVE_PATH,
         )
+    elif MODE == "visualize":
+        if not os.path.isfile(SAVE_PATH):
+            print(f"[ERREUR] Checkpoint introuvable : {SAVE_PATH}")
+            print("  -> Entraînez d'abord le modèle avec MODE='train'.")
+        else:
+            visualize_predictions(
+                model_path = SAVE_PATH,
+                data_root  = TRACKING_ROOT,
+                output_dir = VIZ_DIR,
+                img_size   = (512, 512),
+                n_samples  = 8,       # nombre d'images tirées aléatoirement
+                base_ch    = 32,
+                split      = "test",  # "train", "val" ou "test"
+                # indices  = [0, 5, 42]  # décommenter pour choisir des indices précis
+            )

@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Import du DataLoader depuis dataGathering.py (même dossier)
 sys.path.insert(0, os.path.dirname(__file__))
@@ -487,7 +487,7 @@ def train(
 
     optimizer = Adam(model.parameters(), lr=lr)
     # Réduit le lr ×0.5 toutes les 5 époques pour affiner progressivement
-    scheduler = StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler =CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float("inf")
 
