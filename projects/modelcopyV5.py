@@ -850,7 +850,7 @@ if __name__ == "__main__":
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère des images de débogage dans VIZ_DIR
-    MODE = "visualize"  # "train" ou "visualize"
+    MODE = "train"  # "train" ou "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
