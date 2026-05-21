@@ -336,18 +336,21 @@ class CrowdTrackingNet(nn.Module):
 def tracking_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    w_bg: float = 1.0,
+    w_bg: float = 5.0,
     w_stayed: float = 10.0,
-    w_pts: float = 200.0,
+    w_pts: float = 80.0,
 ) -> torch.Tensor:
     """
     MSE pondérée avec poids séparés par type d'événement.
 
     Valeurs cibles : 0 (fond), STAYED_VAL=2 (stayed), ±1 (entered/left).
-    Avec stayed=2 et pts=±1 :
-        - stayed MSE max : 2² = 4   → ×10 = 40
-        - pts    MSE max : 1² = 1   → ×200 = 200 (pts = pixel unique, besoin fort signal)
-        - bg     MSE    :            → ×1   (pénalise les fausses alarmes)
+    Raisonnement sur les poids :
+        - bg     → ×5   : penalise fortement les faux positifs entered/left
+                          (w_bg=1 était trop faible : le modèle prédisait "entered"
+                           sur tout pixel ressemblant à une tête sans coût suffisant)
+        - stayed → ×10  : stayed = 4 pixels/tête (ligne) → 10×4 = 40 par tête
+        - pts    → ×80  : pts = 1 pixel/tête → 80×1 = 80 par tête
+                          (réduit depuis 200 pour limiter la sur-détection)
 
     Args:
         pred     : sortie du modèle (B, 1, H, W).
@@ -528,14 +531,16 @@ def visualize_predictions(
             pred = model(x)
 
         # Tenseurs → numpy pour affichage
-        frame_a = batch["frame_A"][0].permute(1, 2, 0).numpy()  # (H, W, 3) float
-        frame_b = batch["frame_B"][0].permute(1, 2, 0).numpy()
-        tgt_map  = target[0, 0].cpu().numpy()                    # (H, W) float
+        frame_a  = batch["frame_A"][0].permute(1, 2, 0).numpy()  # (H, W, 3) float
+        frame_b  = batch["frame_B"][0].permute(1, 2, 0).numpy()
+        tgt_map  = target[0, 0].cpu().numpy()                     # (H, W) float
         pred_map = pred[0, 0].cpu().numpy()
 
-        # Frames normalisées [0,1] → BGR uint8
+        # Dénormalisation ImageNet (mean/std appliqués dans dataGathering) → [0, 1]
+        _mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        _std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         def to_bgr(arr):
-            arr = np.clip(arr, 0.0, 1.0)
+            arr = np.clip(arr * _std + _mean, 0.0, 1.0)
             return cv2.cvtColor((arr * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
         fa_bgr = to_bgr(frame_a)
@@ -547,10 +552,7 @@ def visualize_predictions(
 
         # Prédiction brute normalisée → heatmap
         p_min, p_max = pred_map.min(), pred_map.max()
-        if p_max > p_min:
-            pred_norm = (pred_map - p_min) / (p_max - p_min)
-        else:
-            pred_norm = np.zeros_like(pred_map)
+        pred_norm = (pred_map - p_min) / (p_max - p_min) if p_max > p_min else np.zeros_like(pred_map)
         pred_heat = cv2.applyColorMap((pred_norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
 
         def add_label(img, text):
@@ -567,11 +569,48 @@ def visualize_predictions(
         ]
         combined = np.concatenate(panels, axis=1)
 
-        # Métriques de l'échantillon
+        # --- Comptages ground truth (depuis les annotations du sample) --------
+        gt_A       = sample.get("count_A",       "?")
+        gt_B       = sample.get("count_B",       "?")
+        gt_stayed  = sample.get("count_stayed",  "?")
+        gt_left    = sample.get("count_left",    "?")
+        gt_entered = sample.get("count_entered", "?")
+
+        # --- Comptages prédits par maxima locaux (meilleur que composantes connexes) ---
+        # Un "pic" = pixel dont la valeur est le maximum dans son voisinage min_dist×min_dist.
+        # Évite de compter un seul gros blob comme N personnes.
+        def count_peaks(arr, threshold, min_dist=15):
+            above = (arr > threshold).astype(np.uint8)
+            if above.sum() == 0:
+                return 0
+            kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (min_dist, min_dist))
+            dilated = cv2.dilate(arr, kernel)
+            peaks   = (arr == dilated) & (arr > threshold)
+            return int(peaks.sum())
+
+        def count_peaks_neg(arr, threshold, min_dist=15):
+            return count_peaks(-arr, threshold, min_dist)
+
+        pr_stayed  = count_peaks(pred_map,  threshold=STAYED_VAL * 0.5, min_dist=20)
+        pr_entered = count_peaks(pred_map,  threshold=0.3,               min_dist=10)
+        pr_left    = count_peaks_neg(pred_map, threshold=0.3,            min_dist=10)
+
+        # --- Bandeau d'en-tête avec les comptages (2 lignes) ------------------
+        header_h = 56
+        header   = np.zeros((header_h, combined.shape[1], 3), dtype=np.uint8)
+        gt_line   = (f"GT :   Frame A={gt_A} pers.  Frame B={gt_B} pers.  "
+                     f"[ stayed={gt_stayed}  left={gt_left}  entered={gt_entered} ]")
+        pred_line = (f"Pred : stayed~{pr_stayed}  left~{pr_left}  entered~{pr_entered}"
+                     f"   (composantes connexes seuillées)")
+        cv2.putText(header, gt_line,   (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.putText(header, pred_line, (8, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255),   1)
+        combined = np.vstack([header, combined])
+
+        # --- Bande de métriques en bas ----------------------------------------
         m = compute_metrics(pred, target)
         stats = (f"recall={m['recall_pts']:.3f}  iou={m['iou_stayed']:.3f}  "
                  f"mse_bg={m['mse_bg']:.2f}  mse_ev={m['mse_events']:.1f}")
-        cv2.putText(combined, stats, (8, img_h - 8),
+        cv2.putText(combined, stats, (8, combined.shape[0] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
         out_path = os.path.join(output_dir, f"sample_{ds_idx:04d}.png")
@@ -589,7 +628,7 @@ def train(
     data_root: str,
     img_size: tuple = (512, 512),
     batch_size: int = 4,
-    epochs: int = 20,
+    epochs: int = 50,
     lr: float = 1e-3,
     base_ch: int = 32,
     num_workers: int = 0,
@@ -646,14 +685,14 @@ def train(
     print(f"Parametres entrainables : {n_params:,}")
 
     optimizer = Adam(model.parameters(), lr=lr)
-    # Réduit le lr ×0.5 toutes les 5 époques pour affiner progressivement
-    scheduler =CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float("inf")
     best_score    = -float("inf")   # recall_pts + iou_stayed (composite, plus élevé = mieux)
 
     for epoch in range(1, epochs + 1):
-        print(f"\nEpoque {epoch}/{epochs}  —  LR : {scheduler.get_last_lr()[0]:.2e}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"\nEpoque {epoch}/{epochs}  —  LR : {current_lr:.2e}")
 
         # ---- Phase entraînement ----
         model.train()
@@ -709,23 +748,25 @@ def train(
             for k in agg:
                 agg[k] /= n_val
 
+        # Score composite pour le scheduler et la sauvegarde
+        r         = agg["recall_pts"]
+        iou       = agg["iou_stayed"]
+        r_valid   = r   if r   == r   else 0.0   # NaN → 0
+        iou_valid = iou if iou == iou else 0.0
+        score = r_valid + iou_valid
+
         scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        current_lr = optimizer.param_groups[0]["lr"]
 
         print(
             f"Epoque {epoch:>3}/{epochs}  "
             f"train={train_loss:.4f}  val={val_loss:.4f}  "
             f"mse_bg={agg['mse_bg']:.4f}  mse_ev={agg['mse_events']:.2f}  "
-            f"recall_pts={agg['recall_pts']:.3f}  iou_stayed={agg['iou_stayed']:.3f}  "
-            f"lr={current_lr:.2e}"
+            f"recall_pts={r_valid:.3f}  iou_stayed={iou_valid:.3f}  "
+            f"score={score:.3f}  lr={current_lr:.2e}"
         )
 
         # Sauvegarde du meilleur modèle (critère composite : recall_pts + iou_stayed)
-        r   = agg["recall_pts"]
-        iou = agg["iou_stayed"]
-        r_valid   = r   if r   == r   else 0.0   # NaN → 0
-        iou_valid = iou if iou == iou else 0.0
-        score = r_valid + iou_valid
         if score > best_score:
             best_score    = score
             best_val_loss = val_loss
@@ -803,13 +844,13 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net.pth")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net4.pth")
     VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère des images de débogage dans VIZ_DIR
-    MODE = "train"
+    MODE = "visualize"  # "train" ou "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
@@ -822,7 +863,7 @@ if __name__ == "__main__":
             data_root  = TRACKING_ROOT,
             img_size   = (512, 512),
             batch_size = 4,
-            epochs     = 20,
+            epochs     = 50,
             lr         = 1e-3,
             base_ch    = 32,
             num_workers= 0,
