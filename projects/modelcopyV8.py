@@ -39,6 +39,7 @@ import sys
 
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -338,39 +339,47 @@ class CrowdTrackingNet(nn.Module):
 def tracking_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    w_bg: float = 5.0,
-    w_stayed: float = 10.0,
-    w_pts: float = 80.0,
+    w_bg: float = 1.0,
+    w_stayed: float = 5.0,
+    w_pts: float = 20.0,
 ) -> torch.Tensor:
     """
-    MSE pondérée avec poids séparés par type d'événement.
+    MSE par classe avec moyenne intra-classe, puis combinaison pondérée.
 
-    Valeurs cibles : 0 (fond), STAYED_VAL=2 (stayed), ±1 (entered/left).
-    Raisonnement sur les poids :
-        - bg     → ×5   : penalise fortement les faux positifs entered/left
-                          (w_bg=1 était trop faible : le modèle prédisait "entered"
-                           sur tout pixel ressemblant à une tête sans coût suffisant)
-        - stayed → ×10  : stayed = 4 pixels/tête (ligne) → 10×4 = 40 par tête
-        - pts    → ×80  : pts = 1 pixel/tête → 80×1 = 80 par tête
-                          (réduit depuis 200 pour limiter la sur-détection)
+    Pourquoi la moyenne par classe ?
+        Avec .mean() global et ~262 000 pixels bg contre ~100 pixels pts,
+        les poids devaient être absurdes (w_pts=200) pour que pts "compte".
+        Ici chaque classe contribue sa propre MSE moyenne, puis on les combine.
+        Les poids sont directement interprétables : w_pts=20 signifie
+        "une erreur sur une tête compte 20x plus qu'une erreur sur le fond".
+
+    Valeurs cibles : 0 (fond), STAYED_VAL=2.0 (stayed), ±1 (entered/left).
+        → w_pts ↑ si recall trop bas
+        → w_bg  ↑ si trop de faux positifs
 
     Args:
         pred     : sortie du modèle (B, 1, H, W).
         target   : carte cible      (B, 1, H, W).
-        w_bg     : poids des pixels de fond (valeur 0).
-        w_stayed : poids des pixels de trajectoires stayed (valeur STAYED_VAL).
-        w_pts    : poids des pixels entered (+1) et left (-1).
+        w_bg     : importance relative de la classe fond.
+        w_stayed : importance relative de la classe stayed.
+        w_pts    : importance relative de la classe entered/left.
 
     Returns:
         Tensor scalaire différentiable.
     """
-    mask_stayed = (target == 255).float()
-    mask_pts    = (target.abs() == 1).float()
-    mask_bg     = (target == 0).float()
+    # Masques corrects pour STAYED_VAL=2.0 (l'ancienne version cherchait 255)
+    mask_stayed = (target.abs() > 1.5)   # stayed : valeur STAYED_VAL ≈ 2.0
+    mask_pts    = (target.abs() == 1)    # entered (+1) et left (-1)
+    mask_bg     = (target == 0)
 
-    weights = mask_bg * w_bg + mask_stayed * w_stayed + mask_pts * w_pts
+    err_sq = (pred - target) ** 2
 
-    return (weights * (pred - target) ** 2).mean()
+    # Moyenne MSE par classe — chaque classe contribue équitablement
+    loss_bg     = err_sq[mask_bg].mean()     if mask_bg.any()     else pred.new_tensor(0.0)
+    loss_stayed = err_sq[mask_stayed].mean() if mask_stayed.any() else pred.new_tensor(0.0)
+    loss_pts    = err_sq[mask_pts].mean()    if mask_pts.any()    else pred.new_tensor(0.0)
+
+    return w_bg * loss_bg + w_stayed * loss_stayed + w_pts * loss_pts
 
 
 def compute_metrics(
@@ -621,6 +630,85 @@ def visualize_predictions(
 
     print(f"\nVisualisations sauvegardées dans : {output_dir}")
 
+# =============================================================================
+# Courbes d'entraînement
+# =============================================================================
+
+def _plot_training_history(history: dict, save_path: str, best_epoch: int) -> None:
+    """
+    Génère et sauvegarde un graphe 2×2 des courbes d'entraînement.
+
+    Panneaux :
+        Haut-gauche  : Loss train + val
+        Haut-droit   : Recall pts + IoU stayed + Score composite
+        Bas-gauche   : MSE fond + MSE événements
+        Bas-droit    : Learning rate (échelle log)
+
+    Une ligne verticale rouge indique l'époque du meilleur checkpoint.
+
+    Args:
+        history    : dict rempli pendant train() — clés = noms des métriques.
+        save_path  : chemin du fichier PNG de sortie.
+        best_epoch : numéro de l'époque où le meilleur modèle a été sauvegardé.
+    """
+    epochs = list(range(1, len(history["train_loss"]) + 1))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle("Courbes d'entraînement", fontsize=14, fontweight="bold")
+
+    def _vline(ax):
+        if best_epoch > 0:
+            ax.axvline(best_epoch, color="red", linestyle="--", linewidth=1,
+                       label=f"meilleur (ép. {best_epoch})")
+
+    # ── Haut-gauche : losses ──────────────────────────────────────────────────
+    ax = axes[0, 0]
+    ax.plot(epochs, history["train_loss"], label="train loss", color="steelblue")
+    ax.plot(epochs, history["val_loss"],   label="val loss",   color="darkorange")
+    _vline(ax)
+    ax.set_title("Loss")
+    ax.set_xlabel("Époque")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # ── Haut-droit : recall + IoU + score ────────────────────────────────────
+    ax = axes[0, 1]
+    ax.plot(epochs, history["recall_pts"],  label="recall pts",   color="green")
+    ax.plot(epochs, history["iou_stayed"],  label="IoU stayed",   color="purple")
+    ax.plot(epochs, history["score"],       label="score (somme)", color="black",
+            linestyle="--", linewidth=1.5)
+    _vline(ax)
+    ax.set_title("Recall & IoU  (higher = better)")
+    ax.set_xlabel("Époque")
+    ax.set_ylim(0, max(max(history["score"]) * 1.1, 0.1))
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # ── Bas-gauche : MSE détail ───────────────────────────────────────────────
+    ax = axes[1, 0]
+    ax.plot(epochs, history["mse_bg"],     label="MSE fond",      color="gray")
+    ax.plot(epochs, history["mse_events"], label="MSE événements", color="crimson")
+    _vline(ax)
+    ax.set_title("MSE par région")
+    ax.set_xlabel("Époque")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(True, alpha=0.3, which="both")
+
+    # ── Bas-droit : learning rate ─────────────────────────────────────────────
+    ax = axes[1, 1]
+    ax.plot(epochs, history["lr"], color="teal")
+    _vline(ax)
+    ax.set_title("Learning rate")
+    ax.set_xlabel("Époque")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3, which="both")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    print(f"  Courbes sauvegardées : {save_path}")
+    plt.show()
+    plt.close(fig)
+
 
 # =============================================================================
 # Boucle d'entraînement
@@ -690,8 +778,15 @@ def train(
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float("inf")
-    best_score    = -float("inf")   # recall_pts + iou_stayed (composite, plus élevé = mieux)
+    best_score    = -float("inf")
+    best_epoch    = 0
 
+    history = {
+        "train_loss": [], "val_loss": [],
+        "recall_pts": [], "iou_stayed": [], "score": [],
+        "mse_bg": [], "mse_events": [], "lr": [],
+    }
+    
     for epoch in range(1, epochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"\nEpoque {epoch}/{epochs}  —  LR : {current_lr:.2e}")
@@ -768,14 +863,30 @@ def train(
             f"score={score:.3f}  lr={current_lr:.2e}"
         )
 
+
+        # Collecte pour les courbes
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["recall_pts"].append(r_valid)
+        history["iou_stayed"].append(iou_valid)
+        history["score"].append(score)
+        history["mse_bg"].append(agg["mse_bg"])
+        history["mse_events"].append(agg["mse_events"])
+        history["lr"].append(current_lr)
+
         # Sauvegarde du meilleur modèle (critère composite : recall_pts + iou_stayed)
         if score > best_score:
             best_score    = score
             best_val_loss = val_loss
+            best_epoch    = epoch
             torch.save(model.state_dict(), save_path)
             print(f"  -> Sauvegarde : {save_path}  (score={score:.4f}: recall={r_valid:.3f} iou={iou_valid:.3f})")
 
     print(f"\nEntraînement terminé. Meilleur score : {best_score:.4f}  (val_loss assoc. : {best_val_loss:.4f})")
+
+    # Graphe des courbes d'entraînement
+    plot_path = save_path.replace(".pth", "_courbes.png")
+    _plot_training_history(history, plot_path, best_epoch)
 
 
 # =============================================================================
@@ -847,7 +958,7 @@ if __name__ == "__main__":
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
     SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net8.pth")
-    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/8")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
@@ -865,7 +976,7 @@ if __name__ == "__main__":
             data_root  = TRACKING_ROOT,
             img_size   = (512, 512),
             batch_size = 4,
-            epochs     = 50,
+            epochs     = 20,
             lr         = 1e-3,
             base_ch    = 32,
             num_workers= 0,

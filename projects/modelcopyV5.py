@@ -844,13 +844,13 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net4.pth")
-    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net5.pth")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/5")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère des images de débogage dans VIZ_DIR
-    MODE = "train"  # "train" ou "visualize"
+    MODE = "visualize"  # "train" ou "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 

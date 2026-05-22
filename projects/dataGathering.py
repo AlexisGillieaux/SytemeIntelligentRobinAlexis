@@ -54,7 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 sys.path.insert(0, os.path.dirname(__file__))
-from projects.dataCleaning import _compute_shift, _generate_pair, _apply_video_artifacts
+from dataCleaning import _compute_shift, _generate_pair, _apply_video_artifacts
 
 
 # =============================================================================
