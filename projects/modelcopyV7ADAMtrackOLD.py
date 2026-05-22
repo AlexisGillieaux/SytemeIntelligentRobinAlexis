@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.optim import AdamW
+from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Import du DataLoader depuis dataGathering.py (même dossier)
@@ -207,10 +207,12 @@ def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
         nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
+        # nn.ReLU(inplace=True),
+        nn.ELU(inplace=True),
         nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
         nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
+        # nn.ReLU(inplace=True),
+        nn.ELU(inplace=True),
     )
 
 
@@ -340,46 +342,36 @@ def tracking_loss(
     target: torch.Tensor,
     w_bg: float = 1.0,
     w_stayed: float = 5.0,
-    w_pts: float = 20.0,
+    w_pts: float = 200.0,
 ) -> torch.Tensor:
     """
-    MSE par classe avec moyenne intra-classe, puis combinaison pondérée.
+    MSE pondérée avec poids séparés par type d'événement.
 
-    Pourquoi la moyenne par classe ?
-        Avec .mean() global et ~262 000 pixels bg contre ~100 pixels pts,
-        les poids devaient être absurdes (w_pts=200) pour que pts "compte".
-        Ici chaque classe contribue sa propre MSE moyenne, puis on les combine.
-        Les poids sont directement interprétables : w_pts=20 signifie
-        "une erreur sur une tête compte 20x plus qu'une erreur sur le fond".
-
-    Valeurs cibles : 0 (fond), STAYED_VAL=2.0 (stayed), ±1 (entered/left).
-        → w_pts ↑ si recall trop bas
-        → w_bg  ↑ si trop de faux positifs
+    Pourquoi des poids différents ?
+        • fond (0)       : majorité absolue des pixels → poids faible (1)
+        • stayed (255)   : traits de plusieurs pixels chacun → présence non négligeable
+                           mais valeur 255 crée déjà un fort signal MSE → poids modéré (5)
+        • pts (±1)       : un seul pixel par tête entered/left → extrêmement rare
+                           ET valeur faible (±1) → signal MSE minuscule sans pondération
+                           → poids très élevé (200) pour forcer le réseau à les apprendre
 
     Args:
         pred     : sortie du modèle (B, 1, H, W).
         target   : carte cible      (B, 1, H, W).
-        w_bg     : importance relative de la classe fond.
-        w_stayed : importance relative de la classe stayed.
-        w_pts    : importance relative de la classe entered/left.
+        w_bg     : poids des pixels de fond (valeur 0).
+        w_stayed : poids des pixels de trajectoires stayed (valeur 255).
+        w_pts    : poids des pixels entered (+1) et left (-1).
 
     Returns:
         Tensor scalaire différentiable.
     """
-    # Masques corrects pour STAYED_VAL=2.0 (l'ancienne version cherchait 255)
-    mask_stayed = (target.abs() > 1.5)   # stayed : valeur STAYED_VAL ≈ 2.0
-    mask_pts    = (target.abs() == 1)    # entered (+1) et left (-1)
-    mask_bg     = (target == 0)
+    mask_stayed = (target == 255).float()
+    mask_pts    = (target.abs() == 1).float()
+    mask_bg     = (target == 0).float()
 
-    err_sq = (pred - target) ** 2
+    weights = mask_bg * w_bg + mask_stayed * w_stayed + mask_pts * w_pts
 
-    # Moyenne MSE par classe — chaque classe contribue équitablement
-    loss_bg     = err_sq[mask_bg].mean()     if mask_bg.any()     else pred.new_tensor(0.0)
-    loss_stayed = err_sq[mask_stayed].mean() if mask_stayed.any() else pred.new_tensor(0.0)
-    loss_pts    = err_sq[mask_pts].mean()    if mask_pts.any()    else pred.new_tensor(0.0)
-
-    return w_bg * loss_bg + w_stayed * loss_stayed + w_pts * loss_pts
-
+    return (weights * (pred - target) ** 2).mean()
 
 def compute_metrics(
     pred: torch.Tensor,
@@ -631,7 +623,7 @@ def visualize_predictions(
 
 
 # =============================================================================
-# Boucle d'entraînement
+# Courbes d'entraînement
 # =============================================================================
 
 def _plot_training_history(history: dict, save_path: str, best_epoch: int) -> None:
@@ -710,6 +702,10 @@ def _plot_training_history(history: dict, save_path: str, best_epoch: int) -> No
     plt.close(fig)
 
 
+# =============================================================================
+# Boucle d'entraînement
+# =============================================================================
+
 def train(
     data_root: str,
     img_size: tuple = (512, 512),
@@ -770,7 +766,7 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parametres entrainables : {n_params:,}")
 
-    optimizer = AdamW(model.parameters(), lr=lr)
+    optimizer = Adam(model.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     best_val_loss = float("inf")
@@ -857,6 +853,7 @@ def train(
             f"recall_pts={r_valid:.3f}  iou_stayed={iou_valid:.3f}  "
             f"score={score:.3f}  lr={current_lr:.2e}"
         )
+
 
         # Collecte pour les courbes
         history["train_loss"].append(train_loss)
@@ -951,8 +948,8 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net6.pth")
-    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/6")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net7ADAMtrackOLD.pth")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/7ADAMtrackOLD")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint

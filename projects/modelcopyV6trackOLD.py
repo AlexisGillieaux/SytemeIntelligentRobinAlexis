@@ -340,45 +340,36 @@ def tracking_loss(
     target: torch.Tensor,
     w_bg: float = 1.0,
     w_stayed: float = 5.0,
-    w_pts: float = 20.0,
+    w_pts: float = 200.0,
 ) -> torch.Tensor:
     """
-    MSE par classe avec moyenne intra-classe, puis combinaison pondérée.
+    MSE pondérée avec poids séparés par type d'événement.
 
-    Pourquoi la moyenne par classe ?
-        Avec .mean() global et ~262 000 pixels bg contre ~100 pixels pts,
-        les poids devaient être absurdes (w_pts=200) pour que pts "compte".
-        Ici chaque classe contribue sa propre MSE moyenne, puis on les combine.
-        Les poids sont directement interprétables : w_pts=20 signifie
-        "une erreur sur une tête compte 20x plus qu'une erreur sur le fond".
-
-    Valeurs cibles : 0 (fond), STAYED_VAL=2.0 (stayed), ±1 (entered/left).
-        → w_pts ↑ si recall trop bas
-        → w_bg  ↑ si trop de faux positifs
+    Pourquoi des poids différents ?
+        • fond (0)       : majorité absolue des pixels → poids faible (1)
+        • stayed (255)   : traits de plusieurs pixels chacun → présence non négligeable
+                           mais valeur 255 crée déjà un fort signal MSE → poids modéré (5)
+        • pts (±1)       : un seul pixel par tête entered/left → extrêmement rare
+                           ET valeur faible (±1) → signal MSE minuscule sans pondération
+                           → poids très élevé (200) pour forcer le réseau à les apprendre
 
     Args:
         pred     : sortie du modèle (B, 1, H, W).
         target   : carte cible      (B, 1, H, W).
-        w_bg     : importance relative de la classe fond.
-        w_stayed : importance relative de la classe stayed.
-        w_pts    : importance relative de la classe entered/left.
+        w_bg     : poids des pixels de fond (valeur 0).
+        w_stayed : poids des pixels de trajectoires stayed (valeur 255).
+        w_pts    : poids des pixels entered (+1) et left (-1).
 
     Returns:
         Tensor scalaire différentiable.
     """
-    # Masques corrects pour STAYED_VAL=2.0 (l'ancienne version cherchait 255)
-    mask_stayed = (target.abs() > 1.5)   # stayed : valeur STAYED_VAL ≈ 2.0
-    mask_pts    = (target.abs() == 1)    # entered (+1) et left (-1)
-    mask_bg     = (target == 0)
+    mask_stayed = (target == 255).float()
+    mask_pts    = (target.abs() == 1).float()
+    mask_bg     = (target == 0).float()
 
-    err_sq = (pred - target) ** 2
+    weights = mask_bg * w_bg + mask_stayed * w_stayed + mask_pts * w_pts
 
-    # Moyenne MSE par classe — chaque classe contribue équitablement
-    loss_bg     = err_sq[mask_bg].mean()     if mask_bg.any()     else pred.new_tensor(0.0)
-    loss_stayed = err_sq[mask_stayed].mean() if mask_stayed.any() else pred.new_tensor(0.0)
-    loss_pts    = err_sq[mask_pts].mean()    if mask_pts.any()    else pred.new_tensor(0.0)
-
-    return w_bg * loss_bg + w_stayed * loss_stayed + w_pts * loss_pts
+    return (weights * (pred - target) ** 2).mean()
 
 
 def compute_metrics(
@@ -951,8 +942,8 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net6.pth")
-    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/6")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net6trackOLD.pth")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/6trackOLD")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint

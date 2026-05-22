@@ -37,6 +37,7 @@ import os
 import random
 import sys
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-cache")
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
