@@ -980,7 +980,7 @@ if __name__ == "__main__":
             epochs     = 20,
             lr         = 1e-3,
             base_ch    = 32,
-            num_workers= 0,
+            num_workers= 12,
             save_path  = SAVE_PATH,
         )
     elif MODE == "visualize":

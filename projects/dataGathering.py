@@ -1436,7 +1436,7 @@ if __name__ == "__main__":
         img_size=(512, 512),
         generate_density=True,
         augment=True,
-        num_workers=0,  # 0 = pas de multiprocessing (plus sûr sur Windows)
+        num_workers=12,  # 0 = pas de multiprocessing (plus sûr sur Windows)
     )
     # next(iter(loader)) récupère le premier batch
     batch = next(iter(loader))
