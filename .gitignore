@@ -218,3 +218,5 @@ README
 
 #logs
 logs/
+
+.claude/
