@@ -150,7 +150,7 @@ def make_target_map(
         cv2.line(target,
                  (x_B + dx, y_B + dy),   # position précédente (Frame A)
                  (x_B,      y_B),         # position actuelle   (Frame B)
-                 color=STAYED_VAL, thickness=1)
+                 color=STAYED_VAL, thickness=3)
 
     # ---- Entered : gaussienne +1 centrée sur la tête dans Frame B ----
     # Remplace le pixel unique par une gaussienne 2D (σ = SIGMA_PTS).
@@ -162,13 +162,18 @@ def make_target_map(
         if 0 <= x < img_w and 0 <= y < img_h:
             _draw_gaussian(target, x, y, amplitude=1.0)
 
-    # ---- Left : gaussienne -1 centrée sur la position de sortie ----
+    # ---- Left : gaussienne -1 à la position de sortie ----
+    # On ne dessine QUE si la sortie est à l'intérieur de l'image.
+    # Si elle est en dehors (exit clippé au bord), on ne dessine pas :
+    # toutes les têtes sortant par le haut s'empilaient sur y=0 et
+    # le modèle apprenait "bord supérieur = left" au lieu de localiser.
     for i, a in enumerate(gt_A):
         if i in stayed_A_idx:
             continue
-        x_exit = int(np.clip(a["x"] - dx, 0, img_w - 1))
-        y_exit = int(np.clip(a["y"] - dy, 0, img_h - 1))
-        _draw_gaussian(target, x_exit, y_exit, amplitude=-1.0)
+        x_exit_raw = a["x"] - dx
+        y_exit_raw = a["y"] - dy
+        if 0 <= x_exit_raw < img_w and 0 <= y_exit_raw < img_h:
+            _draw_gaussian(target, int(x_exit_raw), int(y_exit_raw), amplitude=-1.0)
 
     # (H, W) numpy → (1, H, W) Tensor PyTorch
     return torch.from_numpy(target).unsqueeze(0)
@@ -375,8 +380,8 @@ class CrowdTrackingNet(nn.Module):
 def tracking_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
-    w_bg: float = 1.0,
-    w_stayed: float = 5.0,
+    w_bg: float = 3.0,
+    w_stayed: float = 2.0,
     w_pts: float = 5.0,
 ) -> torch.Tensor:
     """
@@ -997,8 +1002,8 @@ if __name__ == "__main__":
     TRACKING_ROOT = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "data")
     )
-    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net10Gaussian.pth")
-    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/10Gaussian")
+    SAVE_PATH = os.path.join(os.path.dirname(__file__), "..", "crowd_tracking_net11.pth")
+    VIZ_DIR   = os.path.join(os.path.dirname(__file__), "..", "visualizations/11")
 
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
