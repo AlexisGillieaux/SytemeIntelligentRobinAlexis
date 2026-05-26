@@ -1003,7 +1003,7 @@ if __name__ == "__main__":
     # Changer MODE pour basculer entre entraînement et visualisation
     # "train"     → entraîne le modèle et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère des images de débogage dans VIZ_DIR
-    MODE = "train"  # "train" ou "visualize"
+    MODE = "visualize"  # "train" ou "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
@@ -1015,8 +1015,8 @@ if __name__ == "__main__":
         train(
             data_root  = TRACKING_ROOT,
             img_size   = (512, 512),
-            batch_size = 4,
-            epochs     = 20,
+            batch_size = 16,
+            epochs     = 50,
             lr         = 1e-3,
             base_ch    = 32,
             num_workers= 12,
