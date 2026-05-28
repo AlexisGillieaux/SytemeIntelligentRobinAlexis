@@ -1,5 +1,5 @@
 """
-modelcopyV19.py — CrowdTrackingNet  (tâche simplifiée : stayed uniquement)
+modelcopyV22.py — CrowdTrackingNet  (tâche simplifiée : stayed uniquement)
 ===========================================================================
 
 Changements majeurs par rapport aux versions précédentes (V15–V18) :
@@ -279,14 +279,20 @@ def compute_metrics(
                      if mask_stayed_full.any() else 0.0
 
         pred_stayed = (pred >= stayed_threshold)
-        inter = (pred_stayed & mask_stayed_peak).sum().item()
-        union = (pred_stayed | mask_stayed_peak).sum().item()
-        iou_stayed = inter / union if union > 0 else float("nan")
+        tp    = (pred_stayed &  mask_stayed_peak).sum().item()
+        fp    = (pred_stayed & ~mask_stayed_peak).sum().item()
+        fn    = (~pred_stayed & mask_stayed_peak).sum().item()
+        denom_iou  = tp + fp + fn
+        iou_stayed       = tp / denom_iou        if denom_iou   > 0 else float("nan")
+        precision_stayed = tp / (tp + fp)        if (tp + fp)   > 0 else float("nan")
+        recall_stayed    = tp / (tp + fn)        if (tp + fn)   > 0 else float("nan")
 
     return {
-        "mse_bg":     mse_bg,
-        "mse_stayed": mse_stayed,
-        "iou_stayed": iou_stayed,
+        "mse_bg":           mse_bg,
+        "mse_stayed":       mse_stayed,
+        "iou_stayed":       iou_stayed,
+        "precision_stayed": precision_stayed,
+        "recall_stayed":    recall_stayed,
     }
 
 
@@ -428,14 +434,14 @@ def visualize_predictions(
         combined = np.vstack([header, combined])
 
         m = compute_metrics(pred, target)
-        stats = (f"iou={m['iou_stayed']:.3f}  "
+        stats = (f"iou={m['iou_stayed']:.3f}  prec={m['precision_stayed']:.3f}  rec={m['recall_stayed']:.3f}  "
                  f"mse_bg={m['mse_bg']:.4f}  mse_stayed={m['mse_stayed']:.3f}")
         cv2.putText(combined, stats, (8, combined.shape[0] - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
 
         out_path = os.path.join(output_dir, f"sample_{ds_idx:04d}.png")
         cv2.imwrite(out_path, combined)
-        print(f"  [{sample_num+1}/{len(selected)}] idx={ds_idx} → {out_path}  iou={m['iou_stayed']:.3f}")
+        print(f"  [{sample_num+1}/{len(selected)}] idx={ds_idx} → {out_path}  iou={m['iou_stayed']:.3f}  prec={m['precision_stayed']:.3f}  rec={m['recall_stayed']:.3f}")
 
     print(f"\nVisualisations sauvegardées dans : {output_dir}")
 
@@ -465,11 +471,13 @@ def _plot_training_history(history: dict, save_path: str, best_epoch: int) -> No
     ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
-    ax.plot(epochs, history["iou_stayed"], label="IoU stayed", color="purple")
+    ax.plot(epochs, history["iou_stayed"],       label="IoU",       color="purple")
+    ax.plot(epochs, history["precision_stayed"], label="Précision",  color="steelblue")
+    ax.plot(epochs, history["recall_stayed"],    label="Recall",     color="green")
     _vline(ax)
-    ax.set_title("IoU stayed  (higher = better)")
+    ax.set_title("IoU / Précision / Recall stayed  (higher = better)")
     ax.set_xlabel("Époque")
-    ax.set_ylim(0, max(max(history["iou_stayed"]) * 1.1, 0.1))
+    ax.set_ylim(0, 1.05)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -544,7 +552,7 @@ def train(
 
     history = {
         "train_loss": [], "val_loss": [],
-        "iou_stayed": [],
+        "iou_stayed": [], "precision_stayed": [], "recall_stayed": [],
         "mse_bg": [], "mse_stayed": [], "lr": [],
     }
 
@@ -571,7 +579,8 @@ def train(
         # ---- Validation ----
         model.eval()
         val_loss = 0.0
-        agg = {"mse_bg": 0.0, "mse_stayed": 0.0, "iou_stayed": 0.0}
+        agg = {"mse_bg": 0.0, "mse_stayed": 0.0, "iou_stayed": 0.0,
+               "precision_stayed": 0.0, "recall_stayed": 0.0}
         n_val = 0
         with torch.no_grad():
             for batch in val_loader:
@@ -591,8 +600,12 @@ def train(
             for k in agg:
                 agg[k] /= n_val
 
-        iou = agg["iou_stayed"]
-        iou_valid = iou if iou == iou else 0.0
+        iou  = agg["iou_stayed"]
+        prec = agg["precision_stayed"]
+        rec  = agg["recall_stayed"]
+        iou_valid  = iou  if iou  == iou  else 0.0
+        prec_valid = prec if prec == prec else 0.0
+        rec_valid  = rec  if rec  == rec  else 0.0
 
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
@@ -601,12 +614,14 @@ def train(
             f"Epoque {epoch:>3}/{epochs}  "
             f"train={train_loss:.4f}  val={val_loss:.4f}  "
             f"mse_bg={agg['mse_bg']:.4f}  mse_stayed={agg['mse_stayed']:.4f}  "
-            f"iou_stayed={iou_valid:.3f}  lr={current_lr:.2e}"
+            f"iou={iou_valid:.3f}  prec={prec_valid:.3f}  rec={rec_valid:.3f}  lr={current_lr:.2e}"
         )
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["iou_stayed"].append(iou_valid)
+        history["precision_stayed"].append(prec_valid)
+        history["recall_stayed"].append(rec_valid)
         history["mse_bg"].append(agg["mse_bg"])
         history["mse_stayed"].append(agg["mse_stayed"])
         history["lr"].append(current_lr)
@@ -615,7 +630,7 @@ def train(
             best_val_loss = val_loss
             best_epoch    = epoch
             torch.save(model.state_dict(), save_path)
-            print(f"  -> Sauvegarde : {save_path}  (val_loss={val_loss:.4f}  iou={iou_valid:.3f})")
+            print(f"  -> Sauvegarde : {save_path}  (val_loss={val_loss:.4f}  iou={iou_valid:.3f}  prec={prec_valid:.3f}  rec={rec_valid:.3f})")
 
     print(f"\nEntraînement terminé. Meilleur : ép.{best_epoch}  val_loss={best_val_loss:.4f}")
     plot_path = save_path.replace(".pth", "_courbes.png")
