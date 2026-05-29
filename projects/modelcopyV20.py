@@ -300,19 +300,24 @@ def compute_metrics(
 # Visualisation
 # =============================================================================
 
-def _colorize_map(arr: np.ndarray, is_prediction: bool = False) -> np.ndarray:
+def _colorize_map(
+    arr: np.ndarray,
+    is_prediction: bool = False,
+    pred_threshold: float = 1.5,
+) -> np.ndarray:
     """
     Convertit une carte (H, W) float en image BGR (H, W, 3) uint8.
         Stayed → blanc  (255, 255, 255)
         Fond   → noir   (  0,   0,   0)
 
     Pour la target, seuil bas (0.5) pour visualiser l'étendue de la gaussienne.
-    Pour la prédiction, seuil haut (1.5) pour n'afficher que les pics réels.
+    Pour la prédiction, seuil adaptatif passé en paramètre (par défaut 1.5,
+    mais peut être abaissé si le modèle n'a pas encore convergé à STAYED_VAL).
     """
     h, w = arr.shape
     bgr = np.zeros((h, w, 3), dtype=np.uint8)
     if is_prediction:
-        stayed_mask = arr >= 1.5
+        stayed_mask = arr >= pred_threshold
     else:
         stayed_mask = arr > 0.5   # montre la gaussienne cible jusqu'à 25% du pic
     bgr[stayed_mask] = (255, 255, 255)
@@ -385,12 +390,17 @@ def visualize_predictions(
         fa_bgr = to_bgr(frame_a)
         fb_bgr = to_bgr(frame_b)
 
-        tgt_color   = _colorize_map(tgt_map,  is_prediction=False)
-        pred_thresh = _colorize_map(pred_map, is_prediction=True)
-
         p_min, p_max = pred_map.min(), pred_map.max()
         pred_norm = (pred_map - p_min) / (p_max - p_min) if p_max > p_min else np.zeros_like(pred_map)
         pred_heat = cv2.applyColorMap((pred_norm * 255).astype(np.uint8), cv2.COLORMAP_INFERNO)
+
+        # Seuil adaptatif : top 30 % de la plage de prédiction.
+        # Permet de voir les pics même si le modèle n'a pas encore atteint STAYED_VAL.
+        disp_thresh = float(p_min + (p_max - p_min) * 0.7)
+        disp_thresh = max(disp_thresh, 0.05)
+
+        tgt_color   = _colorize_map(tgt_map,  is_prediction=False)
+        pred_thresh = _colorize_map(pred_map, is_prediction=True, pred_threshold=disp_thresh)
 
         def add_label(img, text):
             out = img.copy()
@@ -401,7 +411,7 @@ def visualize_predictions(
             add_label(fa_bgr,      "Frame A"),
             add_label(fb_bgr,      "Frame B"),
             add_label(tgt_color,   "Target"),
-            add_label(pred_thresh, "Pred (seuil)"),
+            add_label(pred_thresh, f"Pred (seuil>={disp_thresh:.2f})"),
             add_label(pred_heat,   f"Pred brute [{p_min:.2f},{p_max:.2f}]"),
         ]
         combined = np.concatenate(panels, axis=1)
@@ -421,7 +431,7 @@ def visualize_predictions(
             return int(peaks.sum())
 
         # Avec 2 points par paire stayed, on divise par 2 pour estimer le nb de têtes
-        pr_peaks  = count_peaks(pred_map, threshold=1.5, min_dist=10)
+        pr_peaks  = count_peaks(pred_map, threshold=disp_thresh, min_dist=10)
         pr_stayed = pr_peaks // 2   # 2 pics par paire stayed
 
         header_h = 56
