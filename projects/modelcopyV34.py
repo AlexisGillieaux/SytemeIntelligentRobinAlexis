@@ -714,7 +714,7 @@ if __name__ == "__main__":
 
     # "train"     → entraîne et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère les images de débogage
-    MODE = "train"
+    MODE = "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
