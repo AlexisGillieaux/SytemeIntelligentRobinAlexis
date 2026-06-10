@@ -745,7 +745,7 @@ if __name__ == "__main__":
 
     # "train"     → entraîne et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère les images de débogage
-    MODE = "train"
+    MODE = "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
@@ -757,7 +757,7 @@ if __name__ == "__main__":
             data_root   = TRACKING_ROOT,
             img_size    = (1024, 1024),
             batch_size  = 4,
-            epochs      = 100,
+            epochs      = 60,
             lr          = 1e-3,
             base_ch     = 32,
             num_workers = 12,
