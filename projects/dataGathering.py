@@ -54,7 +54,13 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 sys.path.insert(0, os.path.dirname(__file__))
-from dataCleaning import _compute_shift, _generate_pair, _apply_video_artifacts
+from dataCleaning import (
+    _compute_shift,
+    _generate_pair,
+    _compute_warp,
+    _generate_pair_warp,
+    _apply_video_artifacts,
+)
 
 
 # =============================================================================
@@ -803,6 +809,7 @@ class JHUCrowdTrackingDataset(Dataset):
         img_size: tuple | None = None,
         augment: bool = False,
         shift_range: int = 30,
+        jitter_range: int = 15,
         brightness_jitter: float = 0.08,
         color_jitter_vid: float = 0.05,
         noise_sigma: float = 3.0,
@@ -831,7 +838,12 @@ class JHUCrowdTrackingDataset(Dataset):
                 et cohérent sur les deux frames.
 
             shift_range (int):
-                Décalage maximum en pixels entre Frame A et Frame B (défaut 30).
+                Amplitude max du pan global entre Frame A et Frame B (défaut 30).
+
+            jitter_range (int):
+                Amplitude max du jitter par coin pour le warp géométrique
+                (défaut 15, plafonné à 2 % de la dimension). Le décalage entre
+                les deux frames varie alors selon la position dans l'image.
 
             brightness_jitter (float):
                 Amplitude max de variation de luminosité par frame (±, défaut 0.08).
@@ -849,6 +861,7 @@ class JHUCrowdTrackingDataset(Dataset):
         self.img_size          = img_size
         self.augment           = augment and split == "train"
         self.shift_range       = shift_range
+        self.jitter_range      = jitter_range
         self.brightness_jitter = brightness_jitter
         self.color_jitter_vid  = color_jitter_vid
         self.noise_sigma       = noise_sigma
@@ -1108,14 +1121,19 @@ class JHUCrowdTrackingDataset(Dataset):
             raise FileNotFoundError(f"Image introuvable : {img_path}")
         orig_h, orig_w = image_bgr.shape[:2]
 
-        # --- Génération du shift aléatoire à la volée ---
-        # Chaque appel produit un shift différent → diversité entre époques
+        # --- Génération du warp aléatoire à la volée ---
+        # Chaque appel produit un warp différent → diversité entre époques.
+        # Pan global + jitter par coin : le décalage entre les deux frames
+        # varie selon la position dans l'image (cf. dataCleaning._compute_warp).
         rng = np.random.default_rng()
-        dx, dy = _compute_shift(orig_w, orig_h, self.shift_range, rng)
+        H_warp, margin = _compute_warp(
+            orig_w, orig_h, self.shift_range, self.jitter_range, rng
+        )
 
-        # --- Création des deux crops ---
-        frame_A_bgr = image_bgr[0:orig_h - dy, 0:orig_w - dx].copy()
-        frame_B_bgr = image_bgr[dy:orig_h,     dx:orig_w    ].copy()
+        # --- Création des deux frames (même crop central) ---
+        frame_A_bgr = image_bgr[margin:orig_h - margin, margin:orig_w - margin].copy()
+        warped_bgr  = cv2.warpPerspective(image_bgr, H_warp, (orig_w, orig_h))
+        frame_B_bgr = warped_bgr[margin:orig_h - margin, margin:orig_w - margin].copy()
 
         # --- Artefacts vidéo indépendants (bruit, luminosité, couleur) ---
         frame_A_bgr = _apply_video_artifacts(
@@ -1127,7 +1145,7 @@ class JHUCrowdTrackingDataset(Dataset):
 
         # --- Génération des annotations à la volée ---
         anns  = self._load_gt_file(os.path.join(self.gt_dir, f"{img_id}.txt"))
-        gt_A, gt_B, links = _generate_pair(anns, dx, dy, orig_w, orig_h)
+        gt_A, gt_B, links = _generate_pair_warp(anns, H_warp, margin, orig_w, orig_h)
 
         # --- BGR → PIL RGB (pour flip et transforms PyTorch) ---
         img_A = Image.fromarray(cv2.cvtColor(frame_A_bgr, cv2.COLOR_BGR2RGB))
@@ -1140,7 +1158,7 @@ class JHUCrowdTrackingDataset(Dataset):
             )
 
         # --- Redimensionnement ---
-        crop_w, crop_h = orig_w - dx, orig_h - dy
+        crop_w, crop_h = orig_w - 2 * margin, orig_h - 2 * margin
         if self.img_size is not None:
             out_h, out_w = self.img_size
             img_A = img_A.resize((out_w, out_h), Image.BILINEAR)
@@ -1251,6 +1269,7 @@ def get_tracking_dataloader(
     num_workers: int = 0,
     shuffle: bool | None = None,
     shift_range: int = 30,
+    jitter_range: int = 15,
     brightness_jitter: float = 0.08,
     color_jitter_vid: float = 0.05,
     noise_sigma: float = 3.0,
@@ -1310,6 +1329,7 @@ def get_tracking_dataloader(
         img_size          = img_size,
         augment           = augment,
         shift_range       = shift_range,
+        jitter_range      = jitter_range,
         brightness_jitter = brightness_jitter,
         color_jitter_vid  = color_jitter_vid,
         noise_sigma       = noise_sigma,

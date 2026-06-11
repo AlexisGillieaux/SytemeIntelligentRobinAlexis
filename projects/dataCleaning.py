@@ -338,6 +338,167 @@ def _generate_pair(
 
 
 # =============================================================================
+# Warp géométrique — décalage NON uniforme entre Frame A et Frame B
+# =============================================================================
+
+def _compute_warp(
+    orig_w: int,
+    orig_h: int,
+    shift_range: int,
+    jitter_range: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, int]:
+    """
+    Calcule une homographie aléatoire H (3×3) reliant Frame A à Frame B.
+
+    Contrairement à ``_compute_shift`` (translation pure → décalage IDENTIQUE
+    pour toutes les têtes), l'homographie produit un décalage qui VARIE selon
+    la position dans l'image.  C'est essentiel pour entraîner une tête
+    d'offsets façon CenterTrack : le modèle est forcé de lire le déplacement
+    localement au lieu de mémoriser une constante globale.
+
+    Construction :
+        1. Un pan global (dx, dy) est tiré via ``_compute_shift`` — simule le
+           déplacement de la caméra, comme avant.
+        2. Chaque coin de l'image reçoit en plus un jitter indépendant
+           tiré dans [−j, +j] (j plafonné à 2 % de la dimension) — simule
+           rotation / zoom / perspective légers.
+        3. H = transformation perspective envoyant les 4 coins originaux
+           sur les 4 coins déplacés.
+
+    Le déplacement de n'importe quel point de l'image est une interpolation
+    des déplacements des 4 coins → il est borné par max(dx + jx, dy + jy).
+    La marge retournée garantit qu'un crop central [m : dim − m] ne contient
+    aucun pixel hors de l'image source après warp.
+
+    Args:
+        orig_w, orig_h (int) : dimensions de l'image originale.
+        shift_range (int)    : amplitude max du pan global (px).
+        jitter_range (int)   : amplitude max du jitter par coin (px).
+        rng (np.random.Generator) : générateur aléatoire.
+
+    Returns:
+        tuple (H, margin) :
+            H (np.ndarray)  : homographie 3×3 float64 (originale → Frame B).
+            margin (int)    : marge de crop sûre, en pixels.
+    """
+    # 1. Pan global — même logique/bornes que la translation historique
+    dx, dy = _compute_shift(orig_w, orig_h, shift_range, rng)
+
+    # 2. Jitter par coin, plafonné à 2 % de la dimension concernée
+    max_jx = min(jitter_range, max(2, int(0.02 * orig_w)))
+    max_jy = min(jitter_range, max(2, int(0.02 * orig_h)))
+
+    src = np.float32([
+        [0,      0],
+        [orig_w, 0],
+        [orig_w, orig_h],
+        [0,      orig_h],
+    ])
+    jitter = rng.uniform(-1.0, 1.0, size=(4, 2)).astype(np.float32)
+    jitter[:, 0] *= max_jx
+    jitter[:, 1] *= max_jy
+    dst = src + np.float32([dx, dy]) + jitter
+
+    # 3. Homographie envoyant les coins originaux sur les coins déplacés
+    H = cv2.getPerspectiveTransform(src, dst)
+
+    # Marge sûre : déplacement max possible d'un point + sécurité
+    margin = int(np.ceil(max(dx + max_jx, dy + max_jy))) + 2
+
+    return H, margin
+
+
+def _warp_points(points: np.ndarray, H: np.ndarray) -> np.ndarray:
+    """
+    Applique l'homographie H à une liste de points (N, 2) → (N, 2).
+
+    Wrapper autour de cv2.perspectiveTransform qui attend une shape (N, 1, 2)
+    en float32.  Retourne un tableau vide si points est vide.
+    """
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+
+
+def _generate_pair_warp(
+    anns: list[dict],
+    H: np.ndarray,
+    margin: int,
+    orig_w: int,
+    orig_h: int,
+) -> tuple[list[dict], list[dict], list[tuple[int, int]]]:
+    """
+    Répartit les annotations entre Frame A, Frame B et les liens — version warp.
+
+    Logique de répartition
+    ~~~~~~~~~~~~~~~~~~~~~~
+    Les deux frames sont le MÊME crop central de deux versions de l'image :
+
+        Frame A = originale[m : H−m,  m : W−m]
+        Frame B = warp(originale, H)[m : H−m,  m : W−m]
+
+    Pour chaque tête à (xi, yi) dans l'image originale :
+        position dans Frame A : (xi − m,  yi − m)
+        position dans Frame B : H(xi, yi) − (m, m)
+
+    Une tête appartient à une frame si sa position est dans le crop.
+    Le décalage (pos_A − pos_B) varie d'une tête à l'autre selon sa
+    position dans l'image — contrairement à ``_generate_pair``.
+
+    Args:
+        anns (list[dict]) : toutes les têtes de l'image originale.
+        H (np.ndarray)    : homographie 3×3 (sortie de ``_compute_warp``).
+        margin (int)      : marge de crop (sortie de ``_compute_warp``).
+        orig_w, orig_h (int) : dimensions de l'image originale.
+
+    Returns:
+        tuple (gt_A, gt_B, links) — coordonnées RELATIVES à chaque crop ;
+        links = paires (idx_dans_gt_A, idx_dans_gt_B) des têtes "stayed".
+    """
+    crop_w = orig_w - 2 * margin
+    crop_h = orig_h - 2 * margin
+
+    # Positions warpées de toutes les têtes d'un coup
+    pts_orig   = np.array([[a["x"], a["y"]] for a in anns], dtype=np.float32)
+    pts_warped = _warp_points(pts_orig, H)
+
+    gt_A: list[dict] = []
+    gt_B: list[dict] = []
+    orig_to_A: dict[int, int] = {}
+    orig_to_B: dict[int, int] = {}
+
+    for i, a in enumerate(anns):
+        # --- Frame A : coordonnées originales moins la marge ---
+        xa = a["x"] - margin
+        ya = a["y"] - margin
+        if 0 <= xa < crop_w and 0 <= ya < crop_h:
+            ann_a = dict(a)
+            ann_a["x"] = xa
+            ann_a["y"] = ya
+            orig_to_A[i] = len(gt_A)
+            gt_A.append(ann_a)
+
+        # --- Frame B : coordonnées warpées moins la marge ---
+        xb = int(round(float(pts_warped[i, 0]))) - margin
+        yb = int(round(float(pts_warped[i, 1]))) - margin
+        if 0 <= xb < crop_w and 0 <= yb < crop_h:
+            ann_b = dict(a)
+            ann_b["x"] = xb
+            ann_b["y"] = yb
+            orig_to_B[i] = len(gt_B)
+            gt_B.append(ann_b)
+
+    links: list[tuple[int, int]] = []
+    for i in range(len(anns)):
+        if i in orig_to_A and i in orig_to_B:
+            links.append((orig_to_A[i], orig_to_B[i]))
+
+    return gt_A, gt_B, links
+
+
+# =============================================================================
 # Sauvegarde des fichiers générés
 # =============================================================================
 
@@ -505,6 +666,7 @@ def _process_image(
     label_info: dict,
     split_out_dir: str,
     shift_range: int,
+    jitter_range: int,
     brightness_jitter: float,
     color_jitter: float,
     noise_sigma: float,
@@ -515,8 +677,9 @@ def _process_image(
 
     Cette fonction orchestre l'ensemble du pipeline pour une image :
         1. Chargement de l'image avec OpenCV
-        2. Calcul d'un décalage aléatoire (dx, dy)
-        3. Découpage en Frame A et Frame B (deux crops complémentaires)
+        2. Calcul d'un warp géométrique aléatoire (pan global + jitter par coin)
+        3. Frame A = crop central de l'originale ; Frame B = même crop de
+           l'image warpée → le décalage varie selon la position dans l'image
         4. Application d'artefacts vidéo indépendants sur chaque frame
         5. Génération des annotations pour chaque frame et des liens
         6. Sauvegarde des deux images JPEG, des deux fichiers GT et du fichier links
@@ -532,7 +695,8 @@ def _process_image(
         gt_path (str)      : chemin vers le fichier d'annotations .txt original.
         label_info (dict)  : métadonnées de l'image (count, scene, weather, distractor).
         split_out_dir (str): dossier racine du split de sortie (ex : data_tracking/train/).
-        shift_range (int)  : décalage maximum en pixels entre les deux crops.
+        shift_range (int)  : amplitude max du pan global en pixels.
+        jitter_range (int) : amplitude max du jitter par coin en pixels (warp).
         brightness_jitter (float) : amplitude max de variation de luminosité (±).
         color_jitter (float)      : amplitude max du décalage par canal BGR (±).
         noise_sigma (float)       : écart-type du bruit Gaussien additif.
@@ -554,20 +718,18 @@ def _process_image(
 
     orig_h, orig_w = image.shape[:2]  # shape = (hauteur, largeur, canaux)
 
-    # --- Calcul du décalage aléatoire ---
-    dx, dy = _compute_shift(orig_w, orig_h, shift_range, rng)
+    # --- Calcul du warp géométrique aléatoire ---
+    # Pan global + jitter par coin → le décalage entre les deux frames varie
+    # selon la position dans l'image (contrairement à une translation pure).
+    H, margin = _compute_warp(orig_w, orig_h, shift_range, jitter_range, rng)
 
-    # --- Création des deux crops ---
-    # Frame A = coin supérieur-gauche → lignes 0 à orig_h-dy, colonnes 0 à orig_w-dx
-    # L'indexation numpy [y1:y2, x1:x2] sélectionne les pixels dans cet rectangle.
-    # .copy() est nécessaire pour que le tableau résultant soit une vraie copie
-    # indépendante (et non une simple "vue" de l'image originale) — sinon les
-    # modifications des artefacts se répercuteraient sur les deux frames.
-    frame_A = image[0: orig_h - dy,  0: orig_w - dx].copy()
-
-    # Frame B = coin inférieur-droit → lignes dy à orig_h, colonnes dx à orig_w
-    # Les deux crops ont exactement la même taille : (orig_h-dy) × (orig_w-dx)
-    frame_B = image[dy: orig_h,      dx: orig_w].copy()
+    # --- Création des deux frames ---
+    # Frame A = crop central de l'image originale.
+    # Frame B = MÊME crop central de l'image warpée par H.
+    # La marge garantit que le crop de B ne contient aucun pixel hors-source.
+    frame_A = image[margin: orig_h - margin, margin: orig_w - margin].copy()
+    warped  = cv2.warpPerspective(image, H, (orig_w, orig_h))
+    frame_B = warped[margin: orig_h - margin, margin: orig_w - margin].copy()
 
     # --- Application des artefacts vidéo ---
     # Chaque frame reçoit des paramètres aléatoires INDÉPENDANTS.
@@ -590,7 +752,7 @@ def _process_image(
 
     # --- Génération des annotations ---
     anns = _parse_gt_file(gt_path)
-    gt_A, gt_B, links = _generate_pair(anns, dx, dy, orig_w, orig_h)
+    gt_A, gt_B, links = _generate_pair_warp(anns, H, margin, orig_w, orig_h)
 
     # --- Calcul des statistiques de tracking ---
     count_stayed  = len(links)
@@ -644,6 +806,7 @@ def build_tracking_dataset(
     output_root: str,
     splits: tuple[str, ...] = ("train", "val", "test"),
     shift_range: int = 30,
+    jitter_range: int = 15,
     brightness_jitter: float = 0.08,
     color_jitter: float = 0.05,
     noise_sigma: float = 3.0,
@@ -675,9 +838,12 @@ def build_tracking_dataset(
         data_root (str)   : chemin vers le dossier ``data/`` original.
         output_root (str) : chemin vers le dossier de sortie ``data_tracking/``.
         splits (tuple)    : liste des splits à traiter.
-        shift_range (int) : décalage maximum en pixels entre les deux crops.
+        shift_range (int) : amplitude max du pan global en pixels.
             Valeur par défaut 30 px. Représente un "pan" de caméra d'environ
             2 à 5 % de la dimension de l'image selon sa résolution.
+        jitter_range (int) : amplitude max du jitter par coin en pixels (warp
+            géométrique). Valeur par défaut 15 px, plafonnée à 2 % de la
+            dimension. Avec 0, on retrouve un décalage quasi uniforme.
         brightness_jitter (float) : amplitude max de variation de luminosité (±).
             Valeur par défaut 0.08 → variation de ±8 % autour de la luminosité d'origine.
             Augmenter pour des transitions lumineuses plus marquées (ex : 0.15).
@@ -734,6 +900,7 @@ def build_tracking_dataset(
                 label_info        = labels[img_id],
                 split_out_dir     = split_out_dir,
                 shift_range       = shift_range,
+                jitter_range      = jitter_range,
                 brightness_jitter = brightness_jitter,
                 color_jitter      = color_jitter,
                 noise_sigma       = noise_sigma,

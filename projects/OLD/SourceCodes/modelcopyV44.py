@@ -11,6 +11,11 @@ Nouveautés V44 (base : V42 — têtes séparées) :
   2 canaux) et incrémente w_peak de 10 en 10 (30→40→50→60).
   w_tail=4, w_bg=8, LR warmup 5 ép. inchangés.
 
+  MàJ post-entraînement (réévaluation) :
+    - seuils d'évaluation alignés : pred >= 1.5 (métriques, visus, comptage)
+    - comptage de pics : min_dist=30 (~2 sigma) au lieu de 10
+    - cible Frame A par tête via les liens (compatible warp géométrique)
+
 Architecture : U-Net (6 canaux d'entrée → 2 canaux de sortie).
 """
 
@@ -83,23 +88,17 @@ def make_target_map(
     canvas_B = np.zeros((img_h, img_w), dtype=np.float32)
     canvas_A = np.zeros((img_h, img_w), dtype=np.float32)
 
-    if links:
-        iA0, iB0 = links[0][0], links[0][1]
-        dx = gt_A[iA0]["x"] - gt_B[iB0]["x"]
-        dy = gt_A[iA0]["y"] - gt_B[iB0]["y"]
-    else:
-        dx, dy = 0, 0
-
     for pair in links:
-        iB = int(pair[1])
+        iA, iB = int(pair[0]), int(pair[1])
         x_B, y_B = gt_B[iB]["x"], gt_B[iB]["y"]
 
         # Canal 0 — Frame B : position actuelle
         _draw_gaussian(canvas_B, x_B, y_B, amplitude=STAYED_VAL_B, sigma=SIGMA_STAYED)
 
-        # Canal 1 — Frame A : position précédente
-        x_A = x_B + dx
-        y_A = y_B + dy
+        # Canal 1 — Frame A : position précédente RÉELLE de cette tête,
+        # lue via le lien (et non reconstruite par un offset global) —
+        # exact même quand le décalage varie localement (warp géométrique).
+        x_A, y_A = gt_A[iA]["x"], gt_A[iA]["y"]
         if 0 <= x_A < img_w and 0 <= y_A < img_h:
             _draw_gaussian(canvas_A, x_A, y_A, amplitude=STAYED_VAL_A, sigma=SIGMA_STAYED)
 
@@ -256,7 +255,7 @@ def tracking_loss(
 def compute_metrics(
     pred: torch.Tensor,
     target: torch.Tensor,
-    threshold: float = 1.0,
+    threshold: float = 1.5,
 ) -> dict:
     """
     Calcule les métriques pour les deux canaux.
@@ -325,7 +324,7 @@ def compute_metrics(
 def _colorize_map(
     arr_B: np.ndarray,
     arr_A: np.ndarray,
-    threshold: float = 1.0,
+    threshold: float = 1.5,
 ) -> np.ndarray:
     """
     Produit une image BGR (H, W, 3) depuis deux cartes float.
@@ -352,7 +351,7 @@ def visualize_predictions(
 ) -> None:
     """
     Charge le modèle et sauvegarde des images de débogage (6 panneaux) :
-        Frame A | Frame B | Target (seuil 1.5) | Pred (seuil 1.0)
+        Frame A | Frame B | Target (seuil 1.5) | Pred (seuil 1.5)
         | Pred_B heatmap | Pred_A heatmap
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -416,7 +415,7 @@ def visualize_predictions(
         fb_bgr = to_bgr(frame_b)
 
         tgt_color   = _colorize_map(tgt_B_map,  tgt_A_map,  threshold=1.5)
-        pred_thresh = _colorize_map(pred_B_map, pred_A_map, threshold=1.0)
+        pred_thresh = _colorize_map(pred_B_map, pred_A_map, threshold=1.5)
         pred_heat_B, p_min_B, p_max_B = to_heat(pred_B_map)
         pred_heat_A, p_min_A, p_max_A = to_heat(pred_A_map)
 
@@ -429,7 +428,7 @@ def visualize_predictions(
             add_label(fa_bgr,       "Frame A"),
             add_label(fb_bgr,       "Frame B"),
             add_label(tgt_color,    "Target (B=blanc A=rouge, seuil 1.5)"),
-            add_label(pred_thresh,  "Pred (B=blanc A=rouge, seuil 1.0)"),
+            add_label(pred_thresh,  "Pred (B=blanc A=rouge, seuil 1.5)"),
             add_label(pred_heat_B,  f"Pred_B brute [{p_min_B:.2f},{p_max_B:.2f}]"),
             add_label(pred_heat_A,  f"Pred_A brute [{p_min_A:.2f},{p_max_A:.2f}]"),
         ]
@@ -449,8 +448,8 @@ def visualize_predictions(
             peaks   = (arr == dilated) & (arr > threshold)
             return int(peaks.sum())
 
-        pr_b = count_peaks(pred_B_map, threshold=1.0, min_dist=10)
-        pr_a = count_peaks(pred_A_map, threshold=1.0, min_dist=10)
+        pr_b = count_peaks(pred_B_map, threshold=1.5, min_dist=30)
+        pr_a = count_peaks(pred_A_map, threshold=1.5, min_dist=30)
 
         header_h = 56
         header   = np.zeros((header_h, combined.shape[1], 3), dtype=np.uint8)
@@ -743,7 +742,7 @@ if __name__ == "__main__":
 
     # "train"     → entraîne et sauvegarde le meilleur checkpoint
     # "visualize" → charge le checkpoint et génère les images de débogage
-    MODE = "train"
+    MODE = "visualize"
 
     print(f"data/ : {TRACKING_ROOT}")
 
