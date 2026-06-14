@@ -69,9 +69,22 @@ HEAD_FINETUNED_WEIGHTS = os.path.join(
 # soi-même puis renseigner ici le chemin local du .pt.
 HEAD_WEIGHTS = os.path.join(os.path.dirname(__file__), "crowdhuman_head.pt")
 
-IMG_SIZE   = 1280   # taille d'inférence/entraînement (têtes petites → grand imgsz)
+IMG_SIZE   = 1280   # taille d'INFÉRENCE (batch=1, pas de gradients → 1280 OK)
 CONF_THRES = 0.25   # seuil de confiance des détections
 MAX_DET    = 10000  # nb max de boîtes par image (foule dense → relever fortement)
+
+# --- Paramètres d'ENTRAÎNEMENT (mémoire GPU) ---------------------------------
+# L'entraînement stocke les activations + gradients → bien plus gourmand que
+# l'inférence. Sur un GPU 8 Go (ex. RTX 4060 Laptop), imgsz=1280/batch=8
+# provoque un « out of memory » immédiat. Valeurs sûres pour ~8 Go ci-dessous.
+# Mesuré sur RTX 4060 Laptop (8 Go) : imgsz=1024/batch=4 → pic ~2 Go (grande
+# marge). imgsz=1280/batch=8 → OOM immédiat. Têtes minuscules → garder imgsz haut.
+# Pour plus de VRAM : monter TRAIN_IMG_SIZE (1280) et/ou TRAIN_BATCH.
+# Si OOM (images TRÈS denses peuvent faire un pic) : baisser TRAIN_BATCH à 2 puis 1,
+# puis TRAIN_IMG_SIZE à 768/640.
+TRAIN_IMG_SIZE = 768  # résolution d'entraînement (têtes petites → garder élevé si possible)
+TRAIN_BATCH    = -1     # nb d'images par batch ; -1 = auto (ultralytics vise ~60% VRAM)
+TRAIN_WORKERS  = 4     # threads de chargement (baisser si RAM CPU limitée)
 
 
 def resolve_target(target: str) -> tuple[str, int, str]:
@@ -208,8 +221,9 @@ def train_yolo(
     data_root: str,
     weights: str = PERSON_WEIGHTS,
     epochs: int = 50,
-    img_size: int = IMG_SIZE,
-    batch: int = 8,
+    img_size: int = TRAIN_IMG_SIZE,
+    batch: int = TRAIN_BATCH,
+    workers: int = TRAIN_WORKERS,
 ) -> None:
     """
     Fine-tune YOLO sur la détection de têtes JHU.
@@ -218,6 +232,9 @@ def train_yolo(
       1. Convertit train/ et val/ au format YOLO (labels/).
       2. Génère data.yaml.
       3. Lance ultralytics YOLO(weights).train(...).
+
+    Mémoire GPU : imgsz et batch sont les deux leviers du « out of memory ».
+    Voir les constantes TRAIN_IMG_SIZE / TRAIN_BATCH (réglées pour ~8 Go).
 
     Les poids entraînés sont sauvegardés par ultralytics dans runs/detect/.../weights/best.pt
     """
@@ -234,13 +251,16 @@ def train_yolo(
     yaml_path = os.path.join(os.path.dirname(__file__), "jhu_head.yaml")
     make_data_yaml(data_root, yaml_path)
 
-    print(f"== Fine-tuning YOLO ({weights}) : {epochs} époques, imgsz={img_size} ==")
+    print(f"== Fine-tuning YOLO ({weights}) : {epochs} ép., imgsz={img_size}, batch={batch} ==")
     model = YOLO(weights)
     model.train(
         data=yaml_path,
         epochs=epochs,
         imgsz=img_size,
         batch=batch,
+        workers=workers,
+        cache=False,   # ne pas charger tout le dataset en RAM
+        amp=True,      # précision mixte → moins de VRAM
         name="v50yolo_heads",
     )
     print("Entraînement terminé. Poids : runs/detect/v50yolo_heads/weights/best.pt")
@@ -444,7 +464,7 @@ if __name__ == "__main__":
     # "predict" → inférence (DETECTION_TARGET) + visualisation + comparaison comptage
     # "train"   → convertit JHU au format YOLO et fine-tune sur les TÊTES
     # "compare" → personnes COCO vs têtes côte à côte sur les mêmes images
-    MODE = "train"
+    MODE = "predict"
 
     print(f"data/ : {DATA_ROOT}  |  cible : {DETECTION_TARGET}")
 
@@ -455,8 +475,9 @@ if __name__ == "__main__":
             data_root=DATA_ROOT,
             weights=PERSON_WEIGHTS,
             epochs=50,
-            img_size=IMG_SIZE,
-            batch=8,
+            img_size=TRAIN_IMG_SIZE,
+            batch=TRAIN_BATCH,
+            workers=TRAIN_WORKERS,
         )
     elif MODE == "predict":
         predict_and_visualize(
