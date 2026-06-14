@@ -45,11 +45,15 @@ Modes (variable MODE, en bas du fichier) :
 Dépendance : ultralytics  (pip install ultralytics)
 """
 
+import glob
 import os
 import random
 
 import cv2
 import numpy as np
+
+_HERE = os.path.dirname(os.path.abspath(__file__))  # dossier projects/
+_ROOT = os.path.dirname(_HERE)                       # racine du repo
 
 # --- Réglages généraux -------------------------------------------------------
 
@@ -60,14 +64,20 @@ DETECTION_TARGET = "head_finetuned"
 # Sert de point de départ au fine-tuning ET de baseline "person_coco".
 PERSON_WEIGHTS = "yolo11n.pt"
 
-# Poids du détecteur de têtes fine-tuné sur JHU (produit par MODE="train").
+# Nom du run de fine-tuning (ultralytics crée runs/detect/<RUN_NAME>/).
+RUN_NAME = "v50yolo_heads"
+
+# Emplacement CANONIQUE des poids fine-tunés : ultralytics écrit dans
+# runs/detect/<RUN_NAME>/ RELATIF au répertoire d'exécution (souvent la racine
+# du repo). Sert de défaut ; la localisation réelle est résolue dynamiquement
+# par _find_finetuned_weights() (gère cwd différent et suffixes ...2/3).
 HEAD_FINETUNED_WEIGHTS = os.path.join(
-    os.path.dirname(__file__), "runs", "detect", "v50yolo_heads", "weights", "best.pt"
+    _ROOT, "runs", "detect", RUN_NAME, "weights", "best.pt"
 )
 
 # Poids de têtes EXTERNES (ex. YOLO entraîné sur CrowdHuman). À télécharger
 # soi-même puis renseigner ici le chemin local du .pt.
-HEAD_WEIGHTS = os.path.join(os.path.dirname(__file__), "crowdhuman_head.pt")
+HEAD_WEIGHTS = os.path.join(_HERE, "crowdhuman_head.pt")
 
 IMG_SIZE   = 1280   # taille d'INFÉRENCE (batch=1, pas de gradients → 1280 OK)
 CONF_THRES = 0.25   # seuil de confiance des détections
@@ -87,11 +97,34 @@ TRAIN_BATCH    = -1     # nb d'images par batch ; -1 = auto (ultralytics vise ~6
 TRAIN_WORKERS  = 4     # threads de chargement (baisser si RAM CPU limitée)
 
 
+def _find_finetuned_weights() -> str:
+    """
+    Localise best.pt du fine-tuning, où qu'ultralytics l'ait écrit.
+
+    ultralytics sauvegarde dans runs/ RELATIF au répertoire d'exécution et
+    suffixe le nom si le dossier existe (v50yolo_heads, v50yolo_heads2, ...).
+    On cherche donc best.pt sous les emplacements probables (racine du repo,
+    dossier du script, répertoire courant ; avec ou sans sous-dossier "detect")
+    et on retourne le plus RÉCENT. À défaut, l'emplacement canonique (pour que
+    le message d'erreur reste informatif).
+    """
+    roots = [_ROOT, _HERE, os.getcwd()]
+    cands: list[str] = []
+    for r in roots:
+        for sub in ("runs/detect", "runs"):
+            cands += glob.glob(os.path.join(r, sub, f"{RUN_NAME}*", "weights", "best.pt"))
+    cands = list(set(cands))
+    if not cands:
+        return HEAD_FINETUNED_WEIGHTS
+    return max(cands, key=os.path.getmtime)
+
+
 def resolve_target(target: str) -> tuple[str, int, str]:
     """
     Traduit une cible de détection en (poids, classe ciblée, libellé).
 
-    - head_finetuned : poids JHU fine-tunés, classe 0 = head.
+    - head_finetuned : poids JHU fine-tunés (localisés automatiquement),
+                       classe 0 = head.
     - head_external  : poids CrowdHuman/autres, classe « head » détectée
                        automatiquement dans les noms du modèle (sinon 0).
     - person_coco    : poids COCO, classe 0 = person.
@@ -99,7 +132,7 @@ def resolve_target(target: str) -> tuple[str, int, str]:
     Returns : (weights_path, target_class, libellé court).
     """
     if target == "head_finetuned":
-        return HEAD_FINETUNED_WEIGHTS, 0, "tete"
+        return _find_finetuned_weights(), 0, "tete"
     if target == "head_external":
         return HEAD_WEIGHTS, None, "tete"   # classe résolue à l'inférence
     if target == "person_coco":
@@ -259,11 +292,13 @@ def train_yolo(
         imgsz=img_size,
         batch=batch,
         workers=workers,
-        cache=False,   # ne pas charger tout le dataset en RAM
-        amp=True,      # précision mixte → moins de VRAM
-        name="v50yolo_heads",
+        cache=False,         # ne pas charger tout le dataset en RAM
+        amp=True,            # précision mixte → moins de VRAM
+        project=os.path.join(_ROOT, "runs", "detect"),  # emplacement déterministe
+        name=RUN_NAME,
+        exist_ok=True,       # pas de suffixe v50yolo_heads2/3...
     )
-    print("Entraînement terminé. Poids : runs/detect/v50yolo_heads/weights/best.pt")
+    print(f"Entraînement terminé. Poids : {HEAD_FINETUNED_WEIGHTS}")
 
 
 # =============================================================================
@@ -287,11 +322,11 @@ def _load_model(weights: str):
     is_local = weights.endswith(".pt") and ("/" in weights or "\\" in weights)
     if is_local and not os.path.isfile(weights):
         print(f"[ERREUR] Poids introuvables : {weights}")
-        print("  → Pour des TÊTES, deux options :")
-        print("     1. MODE='train' : fine-tune YOLO sur les têtes JHU (produit best.pt).")
-        print("     2. DETECTION_TARGET='head_external' + télécharger des poids CrowdHuman,")
-        print("        puis renseigner HEAD_WEIGHTS avec leur chemin.")
-        print("  (ou DETECTION_TARGET='person_coco' pour la baseline personnes.)")
+        print("  Emplacements fouillés pour best.pt :")
+        for r in [_ROOT, _HERE, os.getcwd()]:
+            print(f"     - {os.path.join(r, 'runs[/detect]', RUN_NAME + '*', 'weights', 'best.pt')}")
+        print("  → Si best.pt est ailleurs : renseignez son chemin dans HEAD_FINETUNED_WEIGHTS.")
+        print("     Sinon MODE='train' (re)produit les poids, ou DETECTION_TARGET='person_coco'.")
         return None
     return YOLO(weights)
 
