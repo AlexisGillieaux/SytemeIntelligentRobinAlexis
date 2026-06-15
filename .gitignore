@@ -214,9 +214,11 @@ train/
 val/
 License
 README
+videos/
 
 
 #logs
 logs/
 
 .claude/
+
