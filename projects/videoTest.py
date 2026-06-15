@@ -157,6 +157,10 @@ def run_on_video(
         print(f"[ERREUR] Vidéo introuvable : {video_in}")
         return
 
+    # Crée le dossier de sortie (ex. videos/trained/) s'il n'existe pas encore,
+    # sinon cv2.VideoWriter échoue silencieusement.
+    os.makedirs(os.path.dirname(os.path.abspath(video_out)), exist_ok=True)
+
     cap = cv2.VideoCapture(video_in)
     if not cap.isOpened():
         print(f"[ERREUR] Impossible d'ouvrir la vidéo : {video_in}")
@@ -231,7 +235,7 @@ if __name__ == "__main__":
     # Massive strike and protest slam ICE bullying in Minneapolis.mp4 (lourd)
     # Times Square Crowd People 2 HD Video Background.mp4 (leger)
     
-    VIDEO_NAME = "videos/source/Massive strike and protest slam ICE bullying in Minneapolis.mp4"
+    VIDEO_NAME = "videos/source/Times Square Crowd People 2 HD Video Background.mp4"
     VIDEO_IN   = os.path.join(_ROOT, VIDEO_NAME)
 
     # --- Options communes ----------------------------------------------------

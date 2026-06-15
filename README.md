@@ -23,31 +23,46 @@ SytemeIntelligentRobinAlexis/
 ├── requirement.txt              ← dépendances Python
 ├── testcuda.py                  ← vérifie la disponibilité de CUDA
 │
-├── data/                        ← dataset JHU-CROWD++ ORIGINAL (non modifié)
+├── data/             [non versionné] ← dataset JHU-CROWD++ ORIGINAL (non modifié)
 │   ├── train/  val/  test/      ← chaque split : images/ + gt/ + image_labels.txt
 │   ├── License  README
 │
-├── data_tracking/               ← paires de frames PRÉ-GÉNÉRÉES (legacy)
+├── data_tracking/    [non versionné] ← paires de frames PRÉ-GÉNÉRÉES (legacy)
 │   └── train/ val/ test/        ← frames_A/ frames_B/ gt_A/ gt_B/ gt_links/
 │                                  (désormais générées à la volée, cf. dataGathering)
 │
-├── data_result/                 ← visualisations + labels de tracking (dataResult.py)
+├── data_result/      [non versionné] ← visualisations + labels de tracking (dataResult.py)
 │   └── train/ val/ test/        ← viz/ (frames annotées) + labels/ (événements)
+│
+├── videos/           [non versionné] ← vidéos de test (.mp4) pour videoTest.py
 │
 ├── projects/                    ← CODE ACTIF
 │   ├── dataCleaning.py          ← génération des paires + warp géométrique
 │   ├── dataGathering.py         ← Dataset/DataLoader PyTorch (paires à la volée)
-│   ├── modelcopyV49.py          ← modèle COURANT (dernière version)
-│   ├── crowd_tracking_net.pth   ← checkpoint de travail
+│   ├── modelcopyV51.py          ← modèle FINAL (U-Net heatmap + offsets)
+│   ├── modelcopyV50YOLO.py      ← détecteur YOLO (têtes), architecture alternative
+│   ├── videoTest.py             ← test V51 / V50YOLO sur une VIDÉO (rendu annoté)
+│   ├── jhu_head.yaml            ← config dataset YOLO (généré)
+│   ├── crowd_tracking_net51.pth ← checkpoint du modèle final
 │   └── OLD/                     ← ARCHIVES
-│       ├── SourceCodes/         ← tous les modelcopyV*.py (V2 → V48)
-│       ├── Models/              ← tous les checkpoints entraînés (.pth, V1 → V48)
+│       ├── SourceCodes/         ← anciens modelcopyV*.py (V2 → V49)
+│       ├── Models/              ← anciens checkpoints (.pth)
 │       └── dataResult.py        ← génération des sorties visuelles/labels
+│
+├── runs/             [non versionné] ← sorties d'entraînement YOLO (ultralytics)
+│   └── detect/v50yolo_heads/weights/best.pt
 │
 ├── Output/                      ← courbes d'entraînement (crowd_tracking_netXX_courbes.png)
 │
 └── visualizations/              ← visus de test par version (visualizations/XX/sample_*.png)
 ```
+
+> **[non versionné]** : les dossiers `data/`, `data_tracking/`, `data_result/`,
+> `videos/` et `runs/` **n'apparaissent pas sur GitHub**. Ce sont des dossiers de
+> **données / sorties** (dataset JHU-CROWD++, paires générées, vidéos de test,
+> checkpoints YOLO), volumineux et non pertinents pour le versionnement du code
+> → ils sont exclus via le `.gitignore`. Il faut donc se procurer le dataset et
+> les vidéos séparément pour reproduire l'entraînement et les tests.
 
 ### Pipeline
 
@@ -132,18 +147,50 @@ Frame A ⊕ Frame B) et l'optimiseur Adam.
 | Ver. | Modification |
 |------|--------------|
 | V48 | **Tête d'offsets façon CenterTrack** : 2 canaux supplémentaires (Δx, Δy) qui, à chaque pic de Frame B, pointent vers la position de la même tête dans Frame A → **association directe A↔B** (flèches vertes dans les visus). Supervision L1 masquée. Introduit aussi le **warp géométrique** (déplacement variable par tête) dans la génération des paires. Base = V45. |
-| V49 | **Focal loss (CenterNet)** sur les heatmaps à la place de la MSE pondérée : sorties sigmoïdées, cibles à pic unitaire. Corrige le **flou de la heatmap Frame B** (la MSE moyennait les positions plausibles ; la focal traite la localisation comme une classification → pics nets). Offsets inchangés. **Version courante.** |
+| V49 | Essai d'une **focal loss (CenterNet)** pour corriger le flou de B → a **dégradé** les performances (sorties sous-confiantes). **Reverté** au régime MSE pondérée éprouvé de V44-V48, en conservant la tête d'offsets et le warp. |
+
+### Phase 8 — Modèle final & architecture alternative (V50 → V51)
+
+| Ver. | Modification |
+|------|--------------|
+| **V50YOLO** | **Architecture totalement différente** : détecteur de boîtes **YOLO** (ultralytics) au lieu du U-Net à heatmap. Détection image par image (pas de paires, pas de tracking). Détecte des **têtes** (fine-tuné sur JHU) ou des personnes (COCO). Sert de comparaison. |
+| **V51** | Modèle **FINAL** : reprend l'architecture U-Net heatmap + offsets (lignée V44-V49 revertée) avec le checkpoint retenu (`crowd_tracking_net51.pth`). |
 
 ---
 
 ## Lancer un entraînement / une visualisation
 
-Le mode se règle en bas du fichier modèle (`MODE = "train"` ou `"visualize"`) :
+**Modèle U-Net (V51)** — le mode se règle en bas du fichier (`MODE = "train"` ou `"visualize"`) :
 
 ```bash
 cd projects
-python modelcopyV49.py
+python modelcopyV51.py
 ```
 
-Les checkpoints sont sauvegardés à la racine (`crowd_tracking_netXX.pth`), les
-courbes dans `Output/`, et les visus de test dans `visualizations/XX/`.
+Checkpoints à la racine (`crowd_tracking_netXX.pth`), courbes dans `Output/`,
+visus de test dans `visualizations/XX/`.
+
+**Détecteur YOLO (V50YOLO)** — `MODE` = `"predict"` / `"train"` / `"compare"`,
+cible via `DETECTION_TARGET` :
+
+```bash
+cd projects
+python modelcopyV50YOLO.py
+```
+
+## Test sur une vidéo (rendu final annoté)
+
+`videoTest.py` applique un modèle sur une vidéo et écrit **une seule vidéo
+annotée en temps réel**. Le modèle se choisit via `MODEL` (`"V51"` ou
+`"V50YOLO"`) ; pour chaque paire de frames consécutives **(i, i+1) = (A, B)** :
+
+- **V51** dessine chaque tête courante + une flèche vers sa position
+  précédente (suivi du mouvement, via les offsets) ;
+- **V50YOLO** dessine les boîtes détectées sur la frame courante.
+
+```bash
+cd projects
+python videoTest.py
+```
+
+Entrée : `videos/source/<vidéo>.mp4` → sortie : `videos/trained/annotated_<MODEL>_<vidéo>.mp4`.
