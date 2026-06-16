@@ -243,7 +243,7 @@ if __name__ == "__main__":
     FRAME_STRIDE = 1    # 1 = toutes les frames ; 2 = une sur deux (plus rapide)
 
     # --- Paramètres spécifiques ----------------------------------------------
-    V51_WEIGHTS  = os.path.join(_HERE, "crowd_tracking_net51.pth")
+    V51_WEIGHTS  = os.path.join(_ROOT, "crowd_tracking_net51.pth")  # checkpoint à la RACINE
     V51_IMG_SIZE = 1024
     V51_PEAK_THRES = 1.5
 

@@ -22,6 +22,9 @@ SytemeIntelligentRobinAlexis/
 ├── README.md                    ← ce fichier
 ├── requirement.txt              ← dépendances Python
 ├── testcuda.py                  ← vérifie la disponibilité de CUDA
+├── crowd_tracking_net51.pth     ← checkpoint du modèle FINAL (V51)
+├── crowd_tracking_net11.pth     ← checkpoint V11 (réactivé pour visualisations comparatives)
+├── yolo11n.pt / yolo26n.pt  [non versionné] ← poids YOLO de base (téléchargés par ultralytics)
 │
 ├── data/             [non versionné] ← dataset JHU-CROWD++ ORIGINAL (non modifié)
 │   ├── train/  val/  test/      ← chaque split : images/ + gt/ + image_labels.txt
@@ -41,13 +44,14 @@ SytemeIntelligentRobinAlexis/
 │   ├── dataGathering.py         ← Dataset/DataLoader PyTorch (paires à la volée)
 │   ├── modelcopyV51.py          ← modèle FINAL (U-Net heatmap + offsets)
 │   ├── modelcopyV50YOLO.py      ← détecteur YOLO (têtes), architecture alternative
+│   ├── modelcopyV11.py          ← ancien modèle réactivé (visualisations comparatives)
 │   ├── videoTest.py             ← test V51 / V50YOLO sur une VIDÉO (rendu annoté)
 │   ├── jhu_head.yaml            ← config dataset YOLO (généré)
-│   ├── crowd_tracking_net51.pth ← checkpoint du modèle final
 │   └── OLD/                     ← ARCHIVES
 │       ├── SourceCodes/         ← anciens modelcopyV*.py (V2 → V49)
 │       ├── Models/              ← anciens checkpoints (.pth)
 │       └── dataResult.py        ← génération des sorties visuelles/labels
+│   (les checkpoints .pth actifs sont à la RACINE, pas ici)
 │
 ├── runs/             [non versionné] ← sorties d'entraînement YOLO (ultralytics)
 │   └── detect/v50yolo_heads/weights/best.pt
