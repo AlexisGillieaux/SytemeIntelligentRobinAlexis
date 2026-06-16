@@ -1040,5 +1040,5 @@ if __name__ == "__main__":
                 n_samples  = 8,       # nombre d'images tirées aléatoirement
                 base_ch    = 32,
                 split      = "test",  # "train", "val" ou "test"
-                # indices  = [0, 5, 42]  # décommenter pour choisir des indices précis
+                indices  = [43]  # décommenter pour choisir des indices précis
             )

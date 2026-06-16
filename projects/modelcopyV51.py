@@ -872,4 +872,5 @@ if __name__ == "__main__":
                 n_samples  = 8,
                 base_ch    = 32,
                 split      = "test",
+                indices  = [43]  # décommenter pour choisir des indices précis
             )

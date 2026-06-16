@@ -523,6 +523,7 @@ if __name__ == "__main__":
             n_samples=8,
             conf=CONF_THRES,
             img_size=IMG_SIZE,
+            indices  = [43]  # décommenter pour choisir des indices précis
         )
     elif MODE == "compare":
         compare_targets(
